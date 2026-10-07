@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Generated development subsets; rebuild with scripts/build_dev_subset.py.
+# Source manifests under data/manifests/ stay tracked.
+data/dev/
