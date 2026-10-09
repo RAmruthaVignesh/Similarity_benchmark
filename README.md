@@ -6,8 +6,8 @@ A benchmark for similarity over relational databases, built on
 
 The project currently covers the data foundation: reading a dataset's schema,
 representing it as a graph, and building a small, validated local subset to
-develop against. Signal discovery, similarity computation and benchmark
-generation are not implemented yet.
+develop against. It also has a first, schema-only signal-discovery baseline.
+Similarity computation and benchmark generation are not implemented yet.
 
 ## Layout
 
@@ -26,10 +26,14 @@ src/
     dev_subset_validation.py  integrity checks and statistics for a subset
   schema/
     schema_graph.py           SchemaGraph: tables and foreign keys as a graph
+  signals/
+    candidates.py             direct attributes and relational-path candidates
+    scorers.py                MiniLM cross-encoder and Decider decision backends
 scripts/
   inspect_manifest.py         print a parsed manifest
   build_dev_subset.py         build data/dev/<dataset>/
   validate_dev_subset.py      validate a subset and print statistics
+  discover_signals.py         enumerate and score schema signals for conditions
 tests/                        unittest suites, all offline
 ```
 
@@ -222,6 +226,62 @@ every validation check.
 Customers are sparse in both: about 1.1 reviews per customer. Overlap-aware
 sampling connects many more products, but most overlapping pairs still share a
 single customer.
+
+## Schema signal discovery
+
+The first signal-discovery baseline is deliberately independent of data values:
+it enumerates all ordinary columns reachable from each anchor table through
+simple foreign-key paths. `--hop-limit` bounds the maximum number of joins;
+the default is two. Primary keys and foreign-key identifiers are excluded by
+default, while temporal columns remain candidates. Path-only relationship
+candidates are included so a scorer can select a relationship even when no
+single downstream column is decisive.
+
+The same candidate list can be compared with two local scoring approaches:
+
+- `minilm`: a conventional Hugging Face MiniLM cross-encoder. Its sigmoid score
+  is a ranking value, not a calibrated relevance probability.
+- `decider`: a locally loaded Decider/Jev-style model. It selects among all
+  supplied signals and returns one probability distribution across that exact
+  candidate set. It is limited to 255 candidates.
+
+Install a matching backend before running it, for example:
+
+```bash
+pip install torch transformers                         # MiniLM
+pip install decider-ai flash-linear-attention           # Decider on CUDA
+```
+
+Inspect candidates before loading a model:
+
+```bash
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --source-table product \
+  --hop-limit 2 \
+  --list-only \
+  --output results/rel-amazon/schema-candidates.jsonl
+```
+
+Run the two comparable local scoring baselines:
+
+```bash
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --hop-limit 2 --scorer minilm \
+  --output results/rel-amazon/minilm-signals.jsonl
+
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --hop-limit 2 --scorer decider \
+  --model-name Mapika/decider-4b \
+  --output results/rel-amazon/decider-signals.jsonl
+```
+
+Each JSONL result retains the input condition, candidate-generation settings,
+full candidate count and the top-ranked candidates. Treat the returned scores
+as model outputs to evaluate against manual relevance judgements, not as ground
+truth relevance labels.
 
 ## Tests
 

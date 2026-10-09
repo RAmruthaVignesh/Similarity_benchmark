@@ -36,6 +36,10 @@ class RelationalDataset(ABC, Generic[TableT]):
     def get_tables(self) -> tuple[str, ...]:
         """Return the available table names."""
 
+    @abstractmethod
+    def get_column_names(self, table_name: str) -> tuple[str, ...]:
+        """Return the columns available in one table without exposing its backend."""
+
     def has_table(self, table_name: str) -> bool:
         """Return whether ``table_name`` is available."""
         return table_name in self.get_tables()
