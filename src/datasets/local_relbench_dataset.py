@@ -75,6 +75,10 @@ class LocalRelBenchDataset(RelationalDataset[pa.Table]):
         """Return table names in manifest order without loading their data."""
         return self.schema.table_names
 
+    def get_column_names(self, table_name: str) -> tuple[str, ...]:
+        """Return a table's physical columns, loading that local table if needed."""
+        return tuple(self.get_table(table_name).column_names)
+
     def get_primary_key(self, table_name: str) -> str | None:
         """Return the primary-key column declared by the manifest."""
         return self._table_schema(table_name).primary_key
