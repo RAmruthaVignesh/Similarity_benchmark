@@ -237,10 +237,13 @@ default, while temporal columns remain candidates. Path-only relationship
 candidates are included so a scorer can select a relationship even when no
 single downstream column is decisive.
 
-The same candidate list can be compared with two local scoring approaches:
+The same candidate list can be compared with local scoring approaches:
 
 - `minilm`: a conventional Hugging Face MiniLM cross-encoder. Its sigmoid score
   is a ranking value, not a calibrated relevance probability.
+- `qwen3-reranker`: an instruction-aware Qwen3 pairwise reranker. It scores
+  each intent/signal pair independently and is also not a calibrated
+  probability of relevance.
 - `decider`: a locally loaded Decider/Jev-style model. It selects among all
   supplied signals and returns one probability distribution across that exact
   candidate set. It is limited to 255 candidates.
@@ -249,6 +252,7 @@ Install a matching backend before running it, for example:
 
 ```bash
 pip install torch transformers                         # MiniLM
+pip install "transformers>=4.51" accelerate            # Qwen3 reranker (plus torch)
 pip install decider-ai flash-linear-attention           # Decider on CUDA
 ```
 
@@ -276,6 +280,14 @@ python scripts/discover_signals.py \
   --hop-limit 2 --scorer decider \
   --model-name Mapika/decider-4b \
   --output results/rel-amazon/decider-signals.jsonl
+
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --hop-limit 2 --scorer qwen3-reranker \
+  --model-name Qwen/Qwen3-Reranker-4B \
+  --batch-size 8 --device cuda \
+  --output results/rel-amazon/qwen3-reranker-signals.jsonl
+
 ```
 
 Each JSONL result retains the input condition, candidate-generation settings,

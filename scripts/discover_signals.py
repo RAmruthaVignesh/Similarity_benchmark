@@ -18,6 +18,7 @@ from src.signals.candidates import enumerate_signal_candidates  # noqa: E402
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
     MiniLMCrossEncoderScorer,
+    Qwen3RerankerScorer,
 )
 
 DEFAULT_CONDITIONS = REPO_ROOT / "conditions" / "rel-amazon" / "conditions3.jsonl"
@@ -45,7 +46,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--scorer",
-        choices=("minilm", "decider"),
+        choices=("minilm", "decider", "qwen3-reranker"),
         default="minilm",
         help="local scoring backend (default: minilm)",
     )
@@ -69,18 +70,12 @@ def main() -> int:
         "--batch-size",
         type=int,
         default=32,
-        help="MiniLM examples per batch (default: 32)",
+        help="pairwise examples per batch for MiniLM/Qwen3 reranker (default: 32)",
     )
     parser.add_argument(
         "--device",
         default="auto",
         help="MiniLM device, e.g. cuda, cuda:0, cpu (default: auto)",
-    )
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=20,
-        help="maximum ranked signals retained per condition (default: 20)",
     )
     parser.add_argument(
         "--include-structural-columns",
@@ -100,8 +95,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.hop_limit < 0:
         parser.error("--hop-limit must be non-negative")
-    if args.top_k <= 0:
-        parser.error("--top-k must be positive")
     if args.list_only and args.output is None:
         parser.error("--list-only requires --output")
 
@@ -126,7 +119,7 @@ def main() -> int:
             else:
                 scored_signals = scorer.score(condition["condition"], candidates, graph)
                 signals = [
-                    scored.to_dict(graph) for scored in scored_signals[: args.top_k]
+                    scored.to_dict(graph) for scored in scored_signals
                 ]
                 probability_distribution = (
                     {
@@ -194,7 +187,15 @@ def _build_scorer(args: argparse.Namespace) -> Any:
             device=args.device,
             batch_size=args.batch_size,
         )
-    return DeciderSignalScorer(model_name=args.model_name or "Mapika/decider-4b")
+    if args.scorer == "decider":
+        return DeciderSignalScorer(model_name=args.model_name or "Mapika/decider-4b")
+    if args.scorer == "qwen3-reranker":
+        return Qwen3RerankerScorer(
+            model_name=args.model_name or "Qwen/Qwen3-Reranker-4B",
+            device=args.device,
+            batch_size=args.batch_size,
+        )
+    raise ValueError(f"unsupported scorer: {args.scorer}")
 
 
 def _write_jsonl(records: Iterable[dict[str, object]], output: Path | None) -> None:
