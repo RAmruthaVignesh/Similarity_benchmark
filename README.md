@@ -19,6 +19,8 @@ data/
 src/
   datasets/
     relbench_manifest.py      parse a manifest into dataclasses
+    relational_dataset.py     storage-independent relational dataset interface
+    local_relbench_dataset.py lazy access to a local Parquet subset
     dev_subset.py             DevSubsetConfig: subset size, sampling mode, paths
     dev_subset_builder.py     build a subset from the remote parquet files
     dev_subset_validation.py  integrity checks and statistics for a subset
@@ -73,6 +75,57 @@ graph.find_paths("product", max_hops=2)  # [["product", "review"], ["product", "
 `get_relationship` returns `None` for unrelated tables and raises
 `SchemaGraphError` for an unknown table or an ambiguous pair. `find_paths`
 returns simple, deterministic paths that follow foreign keys in both directions.
+The shared `ForeignKey` object preserves the complete relationship: source
+column, target table and resolved target primary-key column. For example,
+`review.product_id -> product.product_id`.
+
+## Relational dataset API
+
+`RelationalDataset` is the storage-independent interface used by later
+pipeline stages. It exposes table access and manifest-derived metadata without
+requiring callers to know whether data comes from local Parquet, an in-memory
+table or another backend:
+
+```python
+dataset.get_tables()
+dataset.has_table("product")
+dataset.get_table("product")
+dataset.get_primary_key("product")
+dataset.get_foreign_keys()
+dataset.get_time_column("review")
+dataset.get_entity("product", product_id)
+dataset.get_rows("review", "product_id", product_id)
+```
+
+`LocalRelBenchDataset` implements this interface for a generated local subset.
+It parses `manifest.yaml` during construction but does not load any Parquet
+table until that table is requested. Loaded tables are cached as PyArrow
+tables.
+
+```python
+from src.datasets.local_relbench_dataset import LocalRelBenchDataset
+
+dataset = LocalRelBenchDataset()  # data/dev/rel-amazon/ by default
+
+dataset.get_tables()
+# ('review', 'product', 'customer')
+
+dataset.get_primary_key("product")
+# 'product_id'
+
+dataset.get_time_column("review")
+# 'review_time'
+
+product_id = dataset.get_table("product")["product_id"][0].as_py()
+product = dataset.get_entity("product", product_id)  # one-row pa.Table
+reviews = dataset.get_rows("review", "product_id", product_id)
+```
+
+`get_entity()` uses the primary key declared in the manifest and returns a
+one-row table. `get_rows()` returns all rows equal to the supplied value.
+Unknown tables, unknown columns and missing entities raise clear errors. These
+methods intentionally do not perform joins or path traversal; relational
+traversal remains the responsibility of `SchemaGraph`.
 
 ## Development subset
 
@@ -177,6 +230,8 @@ python -m unittest discover tests
 ```
 
 The tests run offline, using the rel-amazon manifest and small synthetic
-parquet files. They cover `SchemaGraph` (and the manifest parsing it relies
-on), the subset config, both sampling modes and the validator. Set `VERBOSE = 1` (default) or `0` at the top of a test file to show
-or hide its diagnostic printout.
+Parquet files. They cover manifest metadata (including resolved foreign-key
+target columns), `SchemaGraph`, the generic/local dataset APIs and lazy loading,
+the subset config, both sampling modes and the validator. Set `VERBOSE = 1`
+(default) or `0` at the top of a test file to show or hide its diagnostic
+printout.
