@@ -89,7 +89,7 @@ class SchemaGraph:
                         source_table=table.name,
                         source_column=fkey.column,
                         target_table=target.name,
-                        target_column=target.primary_key,
+                        target_column=fkey.target_column or target.primary_key,
                     )
                 )
         return cls(dataset=manifest, edges=tuple(edges))

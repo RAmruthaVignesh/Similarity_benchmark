@@ -9,7 +9,7 @@ columns a manifest names are reported here. Nothing reads or downloads tables.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,13 +31,18 @@ class ManifestError(ValueError):
 
 @dataclass(frozen=True)
 class ForeignKey:
-    """``column`` of the owning table references the primary key of ``target_table``."""
+    """A source ``column`` referencing a column of ``target_table``."""
 
     column: str
     target_table: str
+    target_column: str | None = None
 
-    def to_dict(self) -> dict[str, str]:
-        return {"column": self.column, "target_table": self.target_table}
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "column": self.column,
+            "target_table": self.target_table,
+            "target_column": self.target_column,
+        }
 
 
 @dataclass(frozen=True)
@@ -163,12 +168,31 @@ def parse_manifest(data: Any, *, source: str | None = None) -> DatasetSchema:
             f"manifest '{name}': 'tables' must be a mapping of table name to spec"
         )
 
+    tables = {
+        table_name: _parse_table(table_name, spec)
+        for table_name, spec in raw_tables.items()
+    }
+    tables = {
+        name: replace(
+            table,
+            foreign_keys=tuple(
+                replace(
+                    foreign_key,
+                    target_column=(
+                        tables[foreign_key.target_table].primary_key
+                        if foreign_key.target_table in tables
+                        else None
+                    ),
+                )
+                for foreign_key in table.foreign_keys
+            ),
+        )
+        for name, table in tables.items()
+    }
+
     return DatasetSchema(
         name=name,
-        tables={
-            table_name: _parse_table(table_name, spec)
-            for table_name, spec in raw_tables.items()
-        },
+        tables=tables,
         val_timestamp=_parse_timestamp(data.get("val_timestamp")),
         test_timestamp=_parse_timestamp(data.get("test_timestamp")),
         description=data.get("description"),
