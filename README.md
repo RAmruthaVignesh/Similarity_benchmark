@@ -4,10 +4,45 @@ A benchmark for similarity over relational databases, built on
 [RelBench](https://relbench.stanford.edu/). The initial development dataset is
 **rel-amazon** (customers, products and time-stamped reviews).
 
-The project currently covers the data foundation: reading a dataset's schema,
+The project covers the data foundation: reading a dataset's schema,
 representing it as a graph, and building a small, validated local subset to
-develop against. It also has a first, schema-only signal-discovery baseline.
-Similarity computation and benchmark generation are not implemented yet.
+develop against. It includes schema-only signal discovery and a controlled
+evaluation of that stage. End-to-end user-conditioned embeddings and similarity
+evaluation remain under development.
+
+## Controlled signal-discovery evaluation
+
+The repository includes a **controlled synthetic** evaluation for the
+signal-discovery stage. It uses the actual RelAmazon manifest and Parquet
+schemas, and the same full 39-candidate signal pool used by standard runs.
+The builder snapshots only schema metadata into empty Parquet tables; it does
+not copy or use source records. Its 25 conditions cover direct attributes,
+one- and two-hop paths, relationship evidence, multiple relevant signals,
+distractors, AND/OR logic, and temporal reasoning. Each task has explicit
+graded qrels and a rationale. The qrels are author-defined synthetic oracles,
+not human-validated judgments. This tests whether a ranker follows designed
+signal rules; it does not evaluate entity embeddings or replace human
+judgments on real conditions.
+
+```bash
+python scripts/build_controlled_signal_benchmark.py \
+  --schema-root data/dev/rel-amazon \
+  --output-root data/synthetic/controlled-rel-amazon-signals-v2
+
+python scripts/evaluate_controlled_signals.py \
+  --scorer random \
+  --scorer minilm \
+  --scorer qwen3-reranker \
+  --scorer decider \
+  --benchmark-root data/synthetic/controlled-rel-amazon-signals-v2 \
+  --output results/controlled-rel-amazon-signals-v2/summary.json
+```
+
+The summary reports macro nDCG@1/3/5, Recall@1/3/5 for central (grade-3)
+signals, and MRR of the first central signal. The adjacent `*-tasks.jsonl`
+file records the top-ranked signals and per-condition scores for inspection.
+The scorer classes and prompt construction are shared with standard signal
+discovery; only the condition and synthetic qrels differ.
 
 ## Layout
 
@@ -28,7 +63,9 @@ src/
     schema_graph.py           SchemaGraph: tables and foreign keys as a graph
   signals/
     candidates.py             direct attributes and relational-path candidates
-    scorers.py                MiniLM cross-encoder and Decider decision backends
+    scorers.py                MiniLM, Qwen reranker, and Decider backends
+  synthetic/
+    controlled_signal_benchmark_v2.py  real-schema controlled qrels
 scripts/
   inspect_manifest.py         print a parsed manifest
   build_dev_subset.py         build data/dev/<dataset>/

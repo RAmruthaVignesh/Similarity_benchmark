@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
@@ -130,6 +131,16 @@ tables:
         self.assertTrue(candidates)
         self.assertTrue(all(candidate.source_table == "product" for candidate in candidates))
         self.assertTrue(all(candidate.hops == 0 for candidate in candidates))
+
+    def test_get_column_names_reads_parquet_schema_without_loading_table(self):
+        with patch.object(
+            self.dataset,
+            "get_table",
+            side_effect=AssertionError("column lookup must not load table rows"),
+        ):
+            self.assertEqual(
+                self.dataset.get_column_names("product"), ("product_id", "title", "price")
+            )
 
     def test_decider_choice_keeps_categorical_probabilities(self):
         candidates = enumerate_signal_candidates(
