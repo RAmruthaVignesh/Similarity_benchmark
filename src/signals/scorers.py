@@ -281,11 +281,21 @@ class DeciderSignalScorer:
         intent: str,
         candidates: Sequence[SignalCandidate],
         graph: SchemaGraph,
+        *,
+        history_context: str | None = None,
     ) -> tuple[ScoredSignal, ...]:
         if not candidates:
             return ()
+        if len(candidates) == 1:
+            # A one-option categorical choice has probability 1 by definition;
+            # the Decider API itself requires at least two options.
+            return (ScoredSignal(candidates[0], 1.0),)
         client = self._get_client()
-        state = _format_intent_context(intent, candidates, graph)
+        state = (
+            _format_history_rerank_context(intent, history_context)
+            if history_context is not None
+            else _format_intent_context(intent, candidates, graph)
+        )
         if len(candidates) > 255:
             raise ValueError(
                 "Decider multi-choice mode accepts at most 255 candidates; reduce "
@@ -381,6 +391,21 @@ def _format_intent_context(
         "do not assume that a particular table is always the query entity.\n\n"
         f"Schema:\n{_describe_schema(candidates, graph)}\n\n"
         f"User intent: {intent}"
+    )
+
+
+def _format_history_rerank_context(intent: str, history_context: str) -> str:
+    """Prompt Decider to rank the shortlist using search context, not the schema."""
+    if not history_context.strip():
+        raise ValueError("history_context must not be empty")
+    return (
+        "You are performing a final ranking after a constrained graph search. "
+        "Rank only the candidate signals offered as options. Use the user's intent "
+        "and the recorded graph-search history to order them by usefulness. Do not "
+        "invent or add signals, and do not assume that an unlisted signal was found.\n\n"
+        f"User intent: {intent}\n\n"
+        f"Graph-search history:\n{history_context}\n\n"
+        "Which one of the offered signals is most useful for satisfying the intent?"
     )
 
 
