@@ -33,6 +33,7 @@ class LocalRelBenchDataset(RelationalDataset[pa.Table]):
         self.root = Path(root)
         self.schema: DatasetSchema = load_manifest(self.root / "manifest.yaml")
         self._tables: dict[str, pa.Table] = {}
+        self._column_names: dict[str, tuple[str, ...]] = {}
 
     def get_table(self, table_name: str) -> pa.Table:
         """Load and cache one local Parquet table."""
@@ -76,8 +77,12 @@ class LocalRelBenchDataset(RelationalDataset[pa.Table]):
         return self.schema.table_names
 
     def get_column_names(self, table_name: str) -> tuple[str, ...]:
-        """Return a table's physical columns, loading that local table if needed."""
-        return tuple(self.get_table(table_name).column_names)
+        """Return physical columns from Parquet metadata without loading row data."""
+        self._require_table(table_name)
+        if table_name not in self._column_names:
+            parquet_path = self.root / f"{table_name}.parquet"
+            self._column_names[table_name] = tuple(pq.read_schema(parquet_path).names)
+        return self._column_names[table_name]
 
     def get_primary_key(self, table_name: str) -> str | None:
         """Return the primary-key column declared by the manifest."""

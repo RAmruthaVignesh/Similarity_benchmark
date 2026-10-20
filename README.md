@@ -4,10 +4,45 @@ A benchmark for similarity over relational databases, built on
 [RelBench](https://relbench.stanford.edu/). The initial development dataset is
 **rel-amazon** (customers, products and time-stamped reviews).
 
-The project currently covers the data foundation: reading a dataset's schema,
+The project covers the data foundation: reading a dataset's schema,
 representing it as a graph, and building a small, validated local subset to
-develop against. It also has a first, schema-only signal-discovery baseline.
-Similarity computation and benchmark generation are not implemented yet.
+develop against. It includes schema-only signal discovery and a controlled
+evaluation of that stage. End-to-end user-conditioned embeddings and similarity
+evaluation remain under development.
+
+## Controlled signal-discovery evaluation
+
+The repository includes a **controlled synthetic** evaluation for the
+signal-discovery stage. It uses the actual RelAmazon manifest and Parquet
+schemas, and the same full 39-candidate signal pool used by standard runs.
+The builder snapshots only schema metadata into empty Parquet tables; it does
+not copy or use source records. Its 25 conditions cover direct attributes,
+one- and two-hop paths, relationship evidence, multiple relevant signals,
+distractors, AND/OR logic, and temporal reasoning. Each task has explicit
+graded qrels and a rationale. The qrels are author-defined synthetic oracles,
+not human-validated judgments. This tests whether a ranker follows designed
+signal rules; it does not evaluate entity embeddings or replace human
+judgments on real conditions.
+
+```bash
+python scripts/build_controlled_signal_benchmark.py \
+  --schema-root data/dev/rel-amazon \
+  --output-root data/synthetic/controlled-rel-amazon-signals-v2
+
+python scripts/evaluate_controlled_signals.py \
+  --scorer random \
+  --scorer minilm \
+  --scorer qwen3-reranker \
+  --scorer decider \
+  --benchmark-root data/synthetic/controlled-rel-amazon-signals-v2 \
+  --output results/controlled-rel-amazon-signals-v2/summary.json
+```
+
+The summary reports macro nDCG@1/3/5, Recall@1/3/5 for central (grade-3)
+signals, and MRR of the first central signal. The adjacent `*-tasks.jsonl`
+file records the top-ranked signals and per-condition scores for inspection.
+The scorer classes and prompt construction are shared with standard signal
+discovery; only the condition and synthetic qrels differ.
 
 ## Layout
 
@@ -28,7 +63,9 @@ src/
     schema_graph.py           SchemaGraph: tables and foreign keys as a graph
   signals/
     candidates.py             direct attributes and relational-path candidates
-    scorers.py                MiniLM cross-encoder and Decider decision backends
+    scorers.py                MiniLM, Qwen reranker, and Decider backends
+  synthetic/
+    controlled_signal_benchmark_v2.py  real-schema controlled qrels
 scripts/
   inspect_manifest.py         print a parsed manifest
   build_dev_subset.py         build data/dev/<dataset>/
@@ -237,18 +274,31 @@ default, while temporal columns remain candidates. Path-only relationship
 candidates are included so a scorer can select a relationship even when no
 single downstream column is decisive.
 
-The same candidate list can be compared with two local scoring approaches:
+The same candidate list can be compared with local scoring approaches:
 
 - `minilm`: a conventional Hugging Face MiniLM cross-encoder. Its sigmoid score
   is a ranking value, not a calibrated relevance probability.
+- `qwen3-reranker`: an instruction-aware Qwen3 pairwise reranker. It scores
+  each intent/signal pair independently and is also not a calibrated
+  probability of relevance.
 - `decider`: a locally loaded Decider/Jev-style model. It selects among all
   supplied signals and returns one probability distribution across that exact
   candidate set. It is limited to 255 candidates.
+
+`--method decider-graph-reranked --scorer decider` first has Decider explore
+legal graph actions (select a table, emit an attribute/path, traverse one
+foreign key, or stop), then performs a final multi-choice ranking over only the
+discovered shortlist. The final ranking prompt contains the intent and a
+summary of the graph-search decisions—not the full schema. The complete
+state/action trace is saved with the result. Final choice probabilities are
+conditional on the discovered shortlist; undiscovered signals cannot be
+recovered by the final ranking.
 
 Install a matching backend before running it, for example:
 
 ```bash
 pip install torch transformers                         # MiniLM
+pip install "transformers>=4.51" accelerate            # Qwen3 reranker (plus torch)
 pip install decider-ai flash-linear-attention           # Decider on CUDA
 ```
 
@@ -276,12 +326,162 @@ python scripts/discover_signals.py \
   --hop-limit 2 --scorer decider \
   --model-name Mapika/decider-4b \
   --output results/rel-amazon/decider-signals.jsonl
+
+# Decider-guided graph discovery followed by history-conditioned reranking of
+# only the discovered signals.
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --hop-limit 2 --scorer decider --method decider-graph-reranked \
+  --max-decisions 12 --branch-width 2 --max-signals 10 \
+  --model-name Mapika/decider-4b \
+  --output results/rel-amazon/decider-graph-reranked-signals.jsonl
+
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --hop-limit 2 --scorer qwen3-reranker \
+  --model-name Qwen/Qwen3-Reranker-4B \
+  --batch-size 8 --device cuda \
+  --output results/rel-amazon/qwen3-reranker-signals.jsonl
+
 ```
 
 Each JSONL result retains the input condition, candidate-generation settings,
 full candidate count and the top-ranked candidates. Treat the returned scores
 as model outputs to evaluate against manual relevance judgements, not as ground
 truth relevance labels.
+
+## LLM-as-a-judge signal relevance evaluation
+
+`scripts/judge_signals.py` produces **blinded, schema-only, pair-level** LLM
+judgments. Each model sees a condition, one candidate signal (including its
+path), and the schema. It never sees a discovery method, its score, its rank,
+or graph-search history. The output is resumable JSONL: completed labels are
+reused only when the condition, candidate, schema/candidate catalog, prompt,
+model revision, and sampling configuration have the same cache key.
+
+The local presets are Mistral Small 3.2 (24B), Qwen 3.8 27B FP8, Qwen 3.6
+35B-A3B FP8, Meta Muse Glimmer 30B, Z.ai GLM-4.7-Flash (31B-total/3B-active),
+and Google Gemma 4 31B IT. All use
+vLLM's offline batched engine, JSON-Schema-constrained decoding, and prefix
+caching. The Qwen FP8 presets default to one 80 GB H100. The three new
+official BF16 30--31B checkpoints also default to one 80 GB H100, with a
+conservative 2,048-token context limit and four active sequences to preserve
+KV-cache headroom. Install vLLM in the separate SimBench environment; this is
+optional for all other repository functionality:
+
+```bash
+pip install -U "vllm>=0.19.0" mistral-common
+```
+
+Run the same frozen catalog through each judge. Pin a Hugging Face commit hash
+rather than `main` before treating outputs as frozen qrels.
+
+```bash
+mkdir -p /storage/lcostes/model-cache/huggingface \
+  /storage/lcostes/model-cache/vllm \
+  /storage/lcostes/model-cache/torch \
+  /storage/lcostes/model-cache/xdg
+export HF_HOME=/storage/lcostes/model-cache/huggingface
+export HF_HUB_CACHE="$HF_HOME/hub"
+export HF_XET_CACHE="$HF_HOME/xet"
+export VLLM_CACHE_ROOT=/storage/lcostes/model-cache/vllm
+export TORCH_HOME=/storage/lcostes/model-cache/torch
+export XDG_CACHE_HOME=/storage/lcostes/model-cache/xdg
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model mistral \
+  --model-revision main \
+  --batch-size 16 \
+  --output annotations/llm-judged/rel-amazon/mistral-small-3.2.jsonl
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model glm-4.7-flash \
+  --model-revision main \
+  --batch-size 4 \
+  --output annotations/llm-judged/rel-amazon/glm-4.7-flash.jsonl
+```
+
+Before a full run, benchmark steady-state annotation speed without writing any
+judgments. The printed/filed metrics separate model-load and warm-up time from
+prompt throughput, and include prompt/output token rates and JSON validity.
+
+```bash
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model mistral \
+  --batch-size 16 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/mistral-small-3.2-throughput.json
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model muse-glimmer-30b \
+  --batch-size 4 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/muse-glimmer-30b-throughput.json
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model glm-4.7-flash \
+  --batch-size 4 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/glm-4.7-flash-throughput.json
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model gemma-4-31b \
+  --batch-size 4 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/gemma-4-31b-throughput.json
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model qwen3.8-27b-fp8 \
+  --reasoning-effort low \
+  --batch-size 16 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/qwen3.8-low-throughput.json
+
+python scripts/judge_signals.py \
+  --conditions conditions/rel-amazon/conditions3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --model qwen3.6-35b-a3b-fp8 \
+  --reasoning-effort medium \
+  --batch-size 16 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
+  --metrics-output results/llm-judged/rel-amazon/qwen3.6-throughput.json
+```
+
+The judge now uses a strict JSON Schema: exactly the top-level fields `status`,
+`grade`, and `reason` are allowed, with `status` and grade values constrained
+to the rubric. This is prompt version `signal-relevance-v2`; old cached rows
+from v1 will not be reused.
+
+`--reasoning-effort` is versioned in the cache key. Qwen 3.8 supports `none`,
+`low`, `medium`, and `high` (`high` maps to the model's `xhigh`). Qwen 3.6
+supports `none` (direct) or `medium` (thinking enabled); its model interface
+does not expose separate low/high levels. Mistral, Muse Glimmer, GLM-4.7-Flash,
+and Gemma use `none`.
+
+After human calibration, evaluate every discovery result against one frozen
+judgment file. By default, the evaluator rejects incomplete qrels instead of
+quietly treating unjudged signals as irrelevant.
+
+```bash
+python scripts/evaluate_judged_signals.py \
+  --judgments annotations/llm-judged/rel-amazon/glm-4.7-flash.jsonl \
+  --results /storage/lcostes/ray-share/experiments/simbench-signals/minilm.jsonl \
+  --results /storage/lcostes/ray-share/experiments/simbench-signals/qwen3-reranker.jsonl \
+  --results /storage/lcostes/ray-share/experiments/simbench-signals/decider.jsonl \
+  --output results/llm-judged/rel-amazon/glm-4.7-flash-metrics.json
+```
+
+LLM judgments are scalable weak qrels, not human ground truth. The detailed
+rubric, audit protocol, and model-selection rationale are in
+[`LLM_AS_A_JUDGE_DESIGN.md`](LLM_AS_A_JUDGE_DESIGN.md).
 
 ## Tests
 

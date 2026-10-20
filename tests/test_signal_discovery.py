@@ -6,7 +6,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -16,12 +18,22 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.datasets.local_relbench_dataset import LocalRelBenchDataset  # noqa: E402
 from src.schema.schema_graph import SchemaGraph  # noqa: E402
 from src.signals.candidates import enumerate_signal_candidates  # noqa: E402
-from src.signals.scorers import DeciderSignalScorer  # noqa: E402
+from src.signals.graph_navigation import (  # noqa: E402
+    DeciderGraphNavigator,
+    format_search_history,
+)
+from src.signals.scorers import (  # noqa: E402
+    DeciderSignalScorer,
+    Qwen3RerankerScorer,
+    _ranking_logits,
+    _format_intent_context,
+)
 
 
 class _FakeDecider:
     def decide(self, state, questions):
-        del state
+        self.state = state
+        self.questions = questions
         answers = []
         for question in questions:
             options = question["options"]
@@ -31,6 +43,43 @@ class _FakeDecider:
                     "probs": {
                         option: 0.8 if index == 0 else 0.2 / (len(options) - 1)
                         for index, option in enumerate(options)
+                    },
+                }
+            )
+        return answers
+
+
+class _NavigationFakeDecider:
+    """Deterministic choices that exercise root selection, a join, and emission."""
+
+    def __init__(self):
+        self.calls = []
+
+    def decide(self, state, questions):
+        self.calls.append((state, questions))
+        answers = []
+        for question in questions:
+            options = question["options"]
+            if "starting point" in question["question"]:
+                selected = next(option for option in options if option.endswith("product"))
+            elif "Current path: product\n" in state:
+                selected = next(
+                    option for option in options if option.startswith("Traverse relationship:")
+                )
+            elif "Signals already selected across explored branches: Attribute review.rating" in state:
+                selected = next(option for option in options if option.startswith("Stop"))
+            elif "Current path: product --product.product_id" in state:
+                selected = next(
+                    option for option in options if "Select attribute: review.rating" in option
+                )
+            else:
+                selected = next(option for option in options if option.startswith("Stop"))
+            answers.append(
+                {
+                    "choice": selected,
+                    "probs": {
+                        option: 0.9 if option == selected else 0.1 / (len(options) - 1)
+                        for option in options
                     },
                 }
             )
@@ -124,6 +173,16 @@ tables:
         self.assertTrue(all(candidate.source_table == "product" for candidate in candidates))
         self.assertTrue(all(candidate.hops == 0 for candidate in candidates))
 
+    def test_get_column_names_reads_parquet_schema_without_loading_table(self):
+        with patch.object(
+            self.dataset,
+            "get_table",
+            side_effect=AssertionError("column lookup must not load table rows"),
+        ):
+            self.assertEqual(
+                self.dataset.get_column_names("product"), ("product_id", "title", "price")
+            )
+
     def test_decider_choice_keeps_categorical_probabilities(self):
         candidates = enumerate_signal_candidates(
             self.dataset, self.graph, source_tables=["product"], max_hops=0
@@ -132,6 +191,193 @@ tables:
         scored = scorer.score("Find affordable products", candidates, self.graph)
         self.assertEqual(scored[0].score, 0.8)
         self.assertEqual(len(scored), len(candidates))
+
+    def test_decider_graph_reranking_uses_search_history_not_full_schema(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset, self.graph, source_tables=["product"], max_hops=0
+        )[:2]
+        client = _FakeDecider()
+        scorer = DeciderSignalScorer(client=client)
+        ranked = scorer.score(
+            "Find affordable products",
+            candidates,
+            self.graph,
+            history_context=(
+                "Decision 1 (starting-table selection): Decider chose: Start from table: product\n"
+                "Signals collected:\n- Attribute product.price; path: product"
+            ),
+        )
+
+        self.assertEqual({row.candidate.id for row in ranked}, {row.id for row in candidates})
+        self.assertEqual(ranked[0].candidate, candidates[0])
+        self.assertAlmostEqual(sum(row.score for row in ranked), 1.0)
+        self.assertEqual(len(client.questions[0]["options"]), len(candidates))
+        self.assertIn("Graph-search history:", client.state)
+        self.assertIn("Start from table: product", client.state)
+        self.assertNotIn("Tables and attributes:", client.state)
+        self.assertNotIn("review: body, rating, review_time", client.state)
+
+    def test_decider_reranking_singleton_shortlist_needs_no_model_choice(self):
+        candidate = enumerate_signal_candidates(
+            self.dataset, self.graph, source_tables=["product"], max_hops=0
+        )[0]
+        ranked = DeciderSignalScorer().score(
+            "Find affordable products", [candidate], self.graph
+        )
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].score, 1.0)
+
+    def test_qwen_reranker_can_be_configured_without_loading_weights(self):
+        scorer = Qwen3RerankerScorer(batch_size=4, max_length=4096)
+        self.assertEqual(scorer.model_name, "Qwen/Qwen3-Reranker-4B")
+        self.assertEqual(scorer.batch_size, 4)
+        self.assertEqual(scorer.max_length, 4096)
+
+    def test_decider_prompt_includes_schema_and_readable_paths_without_ids(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset, self.graph, source_tables=["product"], max_hops=2
+        )
+        context = _format_intent_context(
+            "Find products reviewed by similar customers", candidates, self.graph
+        )
+        client = _FakeDecider()
+        DeciderSignalScorer(client=client).score(
+            "Find products reviewed by similar customers", candidates, self.graph
+        )
+
+        self.assertEqual(client.state, context)
+        self.assertIn("Tables and attributes:", client.state)
+        self.assertIn("product: price, title", client.state)
+        self.assertIn("review.customer_id references customer.customer_id", client.state)
+        self.assertIn("User intent: Find products reviewed by similar customers", client.state)
+        options = client.questions[0]["options"]
+        self.assertTrue(any("product.title; path: product" in option for option in options))
+        self.assertTrue(
+            any(
+                "review.rating; path: product" in option
+                and "product.product_id←review.product_id" in option
+                for option in options
+            )
+        )
+        self.assertTrue(all(not option.startswith("attribute:") for option in options))
+
+    def test_decider_graph_navigation_has_legal_actions_and_stateful_trace(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset, self.graph, max_hops=2
+        )
+        client = _NavigationFakeDecider()
+        result = DeciderGraphNavigator(
+            client=client,
+            max_hops=2,
+            max_decisions=4,
+            branch_width=1,
+            max_signals=2,
+        ).discover("Find products with strong ratings", candidates, self.graph)
+
+        self.assertEqual(result.model_calls, 4)
+        self.assertIn(
+            "attribute:product:product>review:review.rating",
+            {candidate.id for candidate in result.signals},
+        )
+        self.assertEqual(result.trace[0]["current_path"], None)
+        self.assertEqual(result.trace[0]["model_choice"], "Start from table: product")
+        self.assertEqual(result.trace[1]["current_path"], ["product"])
+        self.assertIn("Current path: product", result.trace[1]["state_context"])
+        self.assertIn(
+            "Prior decisions on this branch: Start from table: product",
+            result.trace[1]["state_context"],
+        )
+        for decision in result.trace:
+            options = [action["option"] for action in decision["legal_actions"]]
+            self.assertEqual(len(options), len(set(options)))
+            for action in decision["expanded_actions"]:
+                self.assertIn(action["option"], options)
+        for decision in result.trace[1:]:
+            path = decision["current_path"]
+            assert path is not None
+            self.assertEqual(len(path), len(set(path)))
+
+    def test_model_selected_root_branches_to_top_tables(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=2)
+        client = _NavigationFakeDecider()
+        result = DeciderGraphNavigator(
+            client=client,
+            max_hops=2,
+            max_decisions=1,
+            branch_width=3,
+            max_signals=2,
+        ).discover("Find products with strong ratings", candidates, self.graph)
+
+        root_event = result.trace[0]
+        self.assertEqual(root_event["model_choice"], "Start from table: product")
+        root_tables = [
+            action["target_table"]
+            for action in root_event["expanded_actions"]
+            if action["kind"] == "start"
+        ]
+        self.assertEqual(len(root_tables), 3)
+        self.assertEqual(root_event["expanded_actions"][0]["target_table"], "product")
+        self.assertEqual(result.model_calls, 1)
+
+    def test_final_prompt_history_summarizes_graph_trace_without_schema_context(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset, self.graph, max_hops=2
+        )
+        client = _NavigationFakeDecider()
+        result = DeciderGraphNavigator(
+            client=client,
+            max_hops=2,
+            max_decisions=1,
+            branch_width=1,
+            max_signals=2,
+        ).discover(
+            "Find products with strong ratings",
+            candidates,
+            self.graph,
+        )
+        history = format_search_history(result, self.graph)
+        self.assertIn("Decision 1 (starting-table selection)", history)
+        self.assertIn("Decider chose:", history)
+        self.assertNotIn("Tables and attributes:", history)
+        self.assertNotIn("state_context", history)
+
+    def test_oracle_root_forces_start_table_and_reserves_equal_search_budget(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=2)
+        client = _NavigationFakeDecider()
+        result = DeciderGraphNavigator(
+            client=client,
+            max_hops=2,
+            max_decisions=4,
+            branch_width=1,
+            max_signals=2,
+        ).discover(
+            "Find products with strong ratings",
+            candidates,
+            self.graph,
+            start_table="product",
+        )
+
+        self.assertEqual(result.model_calls, 3)
+        self.assertEqual(len(client.calls), 3)
+        self.assertTrue(all("starting point" not in call[1][0]["question"] for call in client.calls))
+        self.assertEqual(result.trace[0]["current_path"], ["product"])
+        history = format_search_history(result, self.graph, forced_root="product")
+        self.assertIn("Oracle-forced starting table: product", history)
+        self.assertNotIn("Tables and attributes:", history)
+
+    def test_oracle_root_rejects_unknown_table(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=2)
+        with self.assertRaisesRegex(ValueError, "unknown graph-search start table"):
+            DeciderGraphNavigator(
+                client=_NavigationFakeDecider(), max_decisions=3
+            ).discover("Find products", candidates, self.graph, start_table="missing")
+
+    def test_ranking_logits_preserve_raw_scale_for_softmax(self):
+        one_logit = np.array([[-2.0], [0.5]])
+        two_logits = np.array([[1.0, 3.0], [4.0, 2.0]])
+
+        np.testing.assert_allclose(_ranking_logits(one_logit), [-2.0, 0.5])
+        np.testing.assert_allclose(_ranking_logits(two_logits), [2.0, -2.0])
 
 
 if __name__ == "__main__":

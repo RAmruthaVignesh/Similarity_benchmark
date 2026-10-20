@@ -23,3 +23,6 @@ env/
 # Generated development subsets; rebuild with scripts/build_dev_subset.py.
 # Source manifests under data/manifests/ stay tracked.
 data/dev/
+
+# Deterministic output of scripts/build_controlled_signal_benchmark.py.
+data/synthetic/

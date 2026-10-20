@@ -41,13 +41,10 @@ class SignalCandidate:
         """Return a stable natural-language description for a decision model."""
         path = _describe_path(self.path, graph)
         if self.kind == "relationship":
-            return f"Relationship path from {self.source_table}: {path}."
+            return f"Relationship path: {path}."
         assert self.attribute_table is not None
         assert self.attribute_column is not None
-        return (
-            f"Attribute {self.attribute_table}.{self.attribute_column}, reachable "
-            f"from {self.source_table} through {path}."
-        )
+        return f"Attribute {self.attribute_table}.{self.attribute_column}; path: {path}."
 
     def to_dict(self, graph: SchemaGraph) -> dict[str, object]:
         """A JSON-friendly representation, including the model-facing text."""
@@ -178,9 +175,15 @@ def _describe_path(path: tuple[str, ...], graph: SchemaGraph) -> str:
     for source, target in zip(path, path[1:]):
         edge = _edge_for_step(graph, source, target)
         if edge.source_table == source:
-            parts.append(f"--{edge.source_column}→{edge.target_column}-- {target}")
+            parts.append(
+                f"--{edge.source_table}.{edge.source_column}→"
+                f"{edge.target_table}.{edge.target_column}-- {target}"
+            )
         else:
-            parts.append(f"--{edge.target_column}←{edge.source_column}-- {target}")
+            parts.append(
+                f"--{edge.target_table}.{edge.target_column}←"
+                f"{edge.source_table}.{edge.source_column}-- {target}"
+            )
     return " ".join(parts)
 
 

@@ -1,6 +1,7 @@
 """Schema signal discovery and scoring primitives."""
 
 from src.signals.candidates import SignalCandidate, enumerate_signal_candidates
+from src.signals.graph_navigation import DeciderGraphNavigator, GraphDiscoveryResult
 from src.signals.scorers import (
     DeciderSignalScorer,
     MiniLMCrossEncoderScorer,
@@ -9,6 +10,8 @@ from src.signals.scorers import (
 
 __all__ = [
     "DeciderSignalScorer",
+    "DeciderGraphNavigator",
+    "GraphDiscoveryResult",
     "MiniLMCrossEncoderScorer",
     "ScoredSignal",
     "SignalCandidate",
