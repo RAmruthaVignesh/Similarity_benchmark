@@ -24,5 +24,11 @@ env/
 # Source manifests under data/manifests/ stay tracked.
 data/dev/
 
-# Deterministic output of scripts/build_controlled_signal_benchmark.py.
-data/synthetic/
+# Generated benchmark fixtures and all derived discovery/evaluation outputs.
+# Rebuild them with the documented scripts; do not accidentally commit runs.
+benchmarks/
+results/
+
+# Human judgments are reviewable project data. LLM judgments are generated
+# experiment artifacts, versioned by prompt and model, so keep them local.
+annotations/*/llm/

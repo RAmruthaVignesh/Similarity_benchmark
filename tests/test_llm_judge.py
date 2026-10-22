@@ -13,8 +13,8 @@ import pyarrow.parquet as pq
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.evaluate_judged_signals import ranking_metrics  # noqa: E402
 from src.datasets.local_relbench_dataset import LocalRelBenchDataset  # noqa: E402
+from src.evaluation.ranking_metrics import ranking_metrics  # noqa: E402
 from src.evaluation.llm_judge import (  # noqa: E402
     JudgeConfig,
     build_judge_prompt,
@@ -60,7 +60,6 @@ tables:
         self.assertIn("find affordable products", rendered)
         self.assertIn("tables and attributes", rendered)
         self.assertNotIn("minilm", rendered)
-        self.assertNotIn("qwen", rendered)
         self.assertNotIn("decider", rendered)
 
     def test_response_parsing_is_strict(self):

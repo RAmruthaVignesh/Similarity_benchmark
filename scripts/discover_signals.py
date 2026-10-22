@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,19 +15,22 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.datasets.local_relbench_dataset import LocalRelBenchDataset  # noqa: E402
 from src.schema.schema_graph import SchemaGraph  # noqa: E402
-from src.signals.candidates import enumerate_signal_candidates  # noqa: E402
+from src.signals.candidates import CATALOG_VIEWS, enumerate_signal_candidates  # noqa: E402
 from src.signals.graph_navigation import (  # noqa: E402
     DeciderGraphNavigator,
-    format_search_history,
+    format_explored_schema_view,
 )
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
     MiniLMCrossEncoderScorer,
-    Qwen3RerankerScorer,
+    RandomSignalScorer,
+    create_choice_decider_client,
+    default_decider_model,
 )
 
-DEFAULT_CONDITIONS = REPO_ROOT / "conditions" / "rel-amazon" / "conditions3.jsonl"
+DEFAULT_CONDITIONS = REPO_ROOT / "conditions" / "rel-amazon" / "conditions-v3.jsonl"
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "dev" / "rel-amazon"
+DEFAULT_ORACLE_ROOT_MAP = REPO_ROOT / "conditions" / "rel-amazon" / "oracle-root-map-v3.json"
 
 
 def main() -> int:
@@ -50,18 +54,29 @@ def main() -> int:
     )
     parser.add_argument(
         "--scorer",
-        choices=("minilm", "decider", "qwen3-reranker"),
+        choices=("minilm", "strands-decider", "random"),
         default="minilm",
         help="local scoring backend (default: minilm)",
     )
     parser.add_argument(
         "--method",
-        choices=("rank", "decider-graph-reranked"),
+        choices=(
+            "rank",
+            "decider-graph-reranked",
+            "decider-graph-reranked-oracle-root",
+        ),
         default="rank",
         help=(
             "rank a fixed candidate list, or navigate the graph then rerank only "
-            "the discovered shortlist with Decider (default: rank)"
+            "the discovered shortlist, optionally with a forced target-entity root "
+            "(default: rank)"
         ),
+    )
+    parser.add_argument(
+        "--oracle-root-map",
+        type=Path,
+        default=DEFAULT_ORACLE_ROOT_MAP,
+        help=f"condition-id to starting-table JSON map for oracle-root mode (default: {DEFAULT_ORACLE_ROOT_MAP})",
     )
     parser.add_argument(
         "--model-name",
@@ -74,6 +89,16 @@ def main() -> int:
         help="maximum relational path length in foreign-key hops (default: 2)",
     )
     parser.add_argument(
+        "--catalog-view",
+        choices=(*CATALOG_VIEWS, "both"),
+        default="path-aware",
+        help=(
+            "candidate catalog: path-aware keeps provenance-specific paths; "
+            "feature-collapsed keeps one direct candidate per physical attribute; "
+            "both writes one output JSONL per view (default: path-aware)"
+        ),
+    )
+    parser.add_argument(
         "--source-table",
         action="append",
         dest="source_tables",
@@ -83,8 +108,9 @@ def main() -> int:
         "--batch-size",
         type=int,
         default=32,
-        help="pairwise examples per batch for MiniLM/Qwen3 reranker (default: 32)",
+        help="pairwise examples per batch for MiniLM (default: 32)",
     )
+    parser.add_argument("--seed", type=int, default=0, help="random baseline seed (default: 0)")
     parser.add_argument(
         "--device",
         default="auto",
@@ -134,15 +160,27 @@ def main() -> int:
         parser.error("--max-signals must be positive")
     if args.list_only and args.output is None:
         parser.error("--list-only requires --output")
+    if args.catalog_view == "both" and args.output is None:
+        parser.error("--catalog-view both requires --output to write one file per view")
     if args.list_only and args.method != "rank":
-        parser.error("--list-only cannot be combined with --method decider-graph-reranked")
-    is_graph = args.method == "decider-graph-reranked"
-    if is_graph and args.scorer != "decider":
-        parser.error("Decider graph methods require --scorer decider")
+        parser.error("--list-only cannot be combined with graph-search methods")
+    is_oracle_root = args.method == "decider-graph-reranked-oracle-root"
+    is_graph = args.method in {
+        "decider-graph-reranked",
+        "decider-graph-reranked-oracle-root",
+    }
+    if is_graph and args.scorer != "strands-decider":
+        parser.error("Decider graph methods require --scorer strands-decider")
     if is_graph and args.source_tables:
         parser.error(
             "Decider graph methods choose their own start table; do not pass --source-table"
         )
+    if args.model_name and args.scorer == "random":
+        parser.error("--model-name cannot be used with --scorer random")
+    if is_oracle_root and args.max_decisions < 2:
+        parser.error("oracle-root graph search requires --max-decisions of at least 2")
+    if args.catalog_view == "both":
+        return _run_both_catalog_views(args)
 
     try:
         dataset = LocalRelBenchDataset(args.dataset_root)
@@ -152,36 +190,47 @@ def main() -> int:
             graph,
             source_tables=args.source_tables,
             max_hops=args.hop_limit,
-            include_relationships=not args.no_relationships,
+            include_relationships=(
+                args.catalog_view == "path-aware" and not args.no_relationships
+            ),
             include_structural_columns=args.include_structural_columns,
+            catalog_view=args.catalog_view,
         )
         conditions = list(_load_conditions(args.conditions))
+        oracle_roots = (
+            _load_oracle_roots(args.oracle_root_map, conditions)
+            if is_oracle_root
+            else {}
+        )
         shared_decider = None
         if args.list_only:
             scorer = None
         elif is_graph:
-            try:
-                from decider.infer import Decider
-            except ImportError as error:
-                raise RuntimeError(
-                    "Decider graph reranking requires the decider-ai package"
-                ) from error
-            model_name = args.model_name or "Mapika/decider-4b"
-            shared_decider = Decider(model_name)
-            scorer = DeciderSignalScorer(model_name, client=shared_decider)
+            backend = _decider_backend(args.scorer)
+            model_name = args.model_name or default_decider_model(backend)
+            shared_decider = create_choice_decider_client(
+                backend, model_name, device=args.device
+            )
+            scorer = DeciderSignalScorer(
+                model_name, backend=backend, device=args.device, client=shared_decider
+            )
         else:
             scorer = _build_scorer(args)
         model_name = getattr(scorer, "model_name", None)
         if is_graph:
-            model_name = args.model_name or model_name or "Mapika/decider-4b"
+            model_name = args.model_name or model_name or default_decider_model("strands")
         navigator = (
             DeciderGraphNavigator(
                 model_name=model_name,
+                backend=_decider_backend(args.scorer),
+                device=args.device,
                 max_hops=args.hop_limit,
                 max_decisions=args.max_decisions,
                 branch_width=args.branch_width,
                 max_signals=args.max_signals,
-                include_relationships=not args.no_relationships,
+                include_relationships=(
+                    args.catalog_view == "path-aware" and not args.no_relationships
+                ),
                 client=shared_decider,
             )
             if is_graph
@@ -195,14 +244,22 @@ def main() -> int:
                 probability_distribution = None
                 graph_search = None
             elif navigator is not None:
-                result = navigator.discover(condition["condition"], candidates, graph)
-                history_context = format_search_history(result, graph)
+                oracle_root = oracle_roots.get(condition["id"])
+                result = navigator.discover(
+                    condition["condition"],
+                    candidates,
+                    graph,
+                    start_table=oracle_root,
+                )
+                explored_schema_context = format_explored_schema_view(
+                    result, graph, forced_root=oracle_root
+                )
                 if len(result.signals) > 1:
                     reranked = scorer.score(
                         condition["condition"],
                         result.signals,
                         graph,
-                        history_context=history_context,
+                        explored_schema_context=explored_schema_context,
                     )
                     signals = [scored.to_dict(graph) for scored in reranked]
                     probability_distribution = {
@@ -224,12 +281,14 @@ def main() -> int:
                         scored.candidate.id: scored.score
                         for scored in scored_signals
                     }
-                    if args.scorer == "decider"
+                    if args.scorer == "strands-decider"
                     else None
                 )
                 score_type = (
                     "choice_probability"
-                    if args.scorer == "decider"
+                    if args.scorer == "strands-decider"
+                    else "random_score"
+                    if args.scorer == "random"
                     else "cross_encoder_score"
                 )
                 graph_search = None
@@ -241,11 +300,15 @@ def main() -> int:
                     "scorer": (
                         "schema-only"
                         if args.list_only
-                        else "decider"
-                        if is_graph
                         else args.scorer
                     ),
                     "model_name": model_name,
+                    "signal_catalog": args.catalog_view,
+                    "catalog_definition": (
+                        "path-specific attributes and relationship paths"
+                        if args.catalog_view == "path-aware"
+                        else "one direct candidate per physical attribute; no relationship/path candidates"
+                    ),
                     "hop_limit": args.hop_limit,
                     "source_tables": list(args.source_tables or dataset.get_tables()),
                     "candidate_count": len(candidates),
@@ -253,16 +316,27 @@ def main() -> int:
                     "choice_probabilities": probability_distribution,
                     "signals": signals,
                     **(
+                        {"oracle_root_table": oracle_roots[condition["id"]]}
+                        if is_oracle_root
+                        else {}
+                    ),
+                    **({"random_seed": args.seed} if args.scorer == "random" else {}),
+                    **(
                         {
                             "graph_search": graph_search,
                             "graph_search_config": {
                                 "max_decisions": args.max_decisions,
                                 "branch_width": args.branch_width,
                                 "max_signals": args.max_signals,
+                                "include_relationships": (
+                                    args.catalog_view == "path-aware"
+                                    and not args.no_relationships
+                                ),
+                                "root_mode": "target_entity_proxy" if is_oracle_root else "model_selected",
                                 **(
                                     {
                                         "final_ranking": "Decider over discovered shortlist",
-                                        "final_prompt_context": "graph-search history; no full schema",
+                                        "final_prompt_context": "explored schema view; no search choices or probabilities",
                                     }
                                     if is_graph
                                     else {}
@@ -279,11 +353,57 @@ def main() -> int:
 
     _write_jsonl(records, args.output)
     if args.output is not None:
+        run_label = "schema-only" if args.list_only else f"{args.scorer}/{args.method}"
         print(
-            f"wrote {len(records)} condition result(s) using {args.method} from "
+            f"wrote {len(records)} condition result(s) using {run_label} from "
             f"{len(candidates)} schema candidates, to {args.output}"
         )
     return 0
+
+
+def _run_both_catalog_views(args: argparse.Namespace) -> int:
+    """Run this command once per catalog view with deterministic output names.
+
+    Keeping each catalog in a separate process gives each run a normal, fully
+    self-contained JSONL artifact and avoids mixing candidate universes in one
+    file. This is deliberately a convenience mode: model weights are loaded
+    once per view.
+    """
+    assert args.output is not None  # enforced during argument validation
+    original = list(sys.argv[1:])
+    for catalog_view in CATALOG_VIEWS:
+        output = _catalog_output_path(args.output, catalog_view)
+        child_args = _replace_cli_value(original, "--catalog-view", catalog_view)
+        child_args = _replace_cli_value(child_args, "--output", str(output))
+        print(f"Running {catalog_view} catalog → {output}", flush=True)
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), *child_args],
+            check=False,
+        )
+        if completed.returncode:
+            return completed.returncode
+    return 0
+
+
+def _replace_cli_value(arguments: list[str], flag: str, value: str) -> list[str]:
+    """Replace a required argparse option in either common CLI spelling."""
+    replaced = list(arguments)
+    for index, argument in enumerate(replaced):
+        if argument == flag:
+            if index + 1 >= len(replaced):
+                raise ValueError(f"missing value after {flag}")
+            replaced[index + 1] = value
+            return replaced
+        if argument.startswith(f"{flag}="):
+            replaced[index] = f"{flag}={value}"
+            return replaced
+    raise ValueError(f"{flag} was parsed but is absent from the command line")
+
+
+def _catalog_output_path(output: Path, catalog_view: str) -> Path:
+    suffix = output.suffix or ".jsonl"
+    stem = output.stem if output.suffix else output.name
+    return output.with_name(f"{stem}-{catalog_view}{suffix}")
 
 
 def _load_conditions(path: Path) -> Iterable[dict[str, str]]:
@@ -307,22 +427,46 @@ def _load_conditions(path: Path) -> Iterable[dict[str, str]]:
             yield {"id": identifier, "condition": condition}
 
 
+def _load_oracle_roots(
+    path: Path, conditions: list[dict[str, str]]
+) -> dict[str, str]:
+    try:
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path}: invalid oracle-root JSON: {error.msg}") from error
+    if not isinstance(mapping, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in mapping.items()
+    ):
+        raise ValueError(f"{path}: expected a JSON object mapping condition IDs to table names")
+    missing = sorted(condition["id"] for condition in conditions if condition["id"] not in mapping)
+    if missing:
+        raise ValueError(f"{path}: no oracle root supplied for conditions: {missing}")
+    return mapping
+
+
 def _build_scorer(args: argparse.Namespace) -> Any:
+    if args.scorer == "random":
+        return RandomSignalScorer(seed=args.seed)
     if args.scorer == "minilm":
         return MiniLMCrossEncoderScorer(
             model_name=args.model_name or "cross-encoder/ms-marco-MiniLM-L-6-v2",
             device=args.device,
             batch_size=args.batch_size,
         )
-    if args.scorer == "decider":
-        return DeciderSignalScorer(model_name=args.model_name or "Mapika/decider-4b")
-    if args.scorer == "qwen3-reranker":
-        return Qwen3RerankerScorer(
-            model_name=args.model_name or "Qwen/Qwen3-Reranker-4B",
+    if args.scorer == "strands-decider":
+        return DeciderSignalScorer(
+            model_name=args.model_name or default_decider_model("strands"),
+            backend="strands",
             device=args.device,
-            batch_size=args.batch_size,
         )
     raise ValueError(f"unsupported scorer: {args.scorer}")
+
+
+def _decider_backend(scorer_name: str) -> str:
+    if scorer_name == "strands-decider":
+        return "strands"
+    raise ValueError(f"{scorer_name!r} is not a typed-choice Decider scorer")
 
 
 def _write_jsonl(records: Iterable[dict[str, object]], output: Path | None) -> None:

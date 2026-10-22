@@ -76,7 +76,10 @@ def load_conditions(path: Path) -> list[dict[str, str]]:
             if row["id"] in seen:
                 raise ValueError(f"{path}:{line_number}: duplicate condition ID {row['id']!r}")
             seen.add(row["id"])
-            conditions.append({"id": row["id"], "condition": row["condition"]})
+            conditions.append({
+                "id": row["id"],
+                "condition": row["condition"],
+            })
     if not conditions:
         raise ValueError(f"no conditions found in {path}")
     return conditions
@@ -144,7 +147,10 @@ def run_annotation(args: argparse.Namespace) -> None:
         print("\n" + "=" * 76)
         print(f"Pair {index}/{len(tasks)} | {condition['id']}")
         print(f"INTENT: {condition['condition']}")
-        print(f"SIGNAL: {candidate.describe(graph)}")
+        print(f"\nSIGNAL: {candidate.explain_for_human(graph)}")
+        print("\nPATH:")
+        print(candidate.human_diagram(graph))
+        print(f"\nTECHNICAL DEFINITION: {candidate.describe(graph)}")
         print("\nGrades:")
         for grade, description in LABELS.items():
             print(f"  {grade}: {description}")

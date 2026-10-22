@@ -20,10 +20,12 @@ from typing import Any, Mapping, Sequence
 
 from src.schema.schema_graph import Edge, SchemaGraph
 from src.signals.candidates import SignalCandidate
+from src.signals.scorers import create_choice_decider_client, default_decider_model
 
 __all__ = [
     "DeciderGraphNavigator",
     "GraphDiscoveryResult",
+    "format_explored_schema_view",
     "format_search_history",
 ]
 
@@ -98,8 +100,10 @@ class DeciderGraphNavigator:
 
     def __init__(
         self,
-        model_name: str = "Mapika/decider-4b",
+        model_name: str | None = None,
         *,
+        backend: str = "strands",
+        device: str = "auto",
         max_hops: int = 2,
         max_decisions: int = 12,
         branch_width: int = 2,
@@ -115,7 +119,9 @@ class DeciderGraphNavigator:
             raise ValueError("branch_width must be positive")
         if max_signals <= 0:
             raise ValueError("max_signals must be positive")
-        self.model_name = model_name
+        self.backend = backend
+        self.model_name = model_name or default_decider_model(backend)
+        self.device = device
         self.max_hops = max_hops
         self.max_decisions = max_decisions
         self.branch_width = branch_width
@@ -349,14 +355,19 @@ class DeciderGraphNavigator:
                 )
         if len(state.path) - 1 < self.max_hops:
             for target, edge in _available_steps(graph, state.path):
-                actions.append(
-                    _Action(
-                        "traverse",
-                        f"Traverse relationship: {_describe_step(state.path[-1], target, edge)}",
-                        target_table=target,
-                        edge=edge,
+                next_path = (*state.path, target)
+                # In the feature-collapsed catalog there are deliberately no
+                # path-specific candidates beyond a root. Do not spend a Decider
+                # call exploring a branch which cannot emit any signal.
+                if catalog.has_content_below(state.root_table, next_path):
+                    actions.append(
+                        _Action(
+                            "traverse",
+                            f"Traverse relationship: {_describe_step(state.path[-1], target, edge)}",
+                            target_table=target,
+                            edge=edge,
+                        )
                     )
-                )
         actions.extend(
             (
                 _Action(
@@ -398,14 +409,9 @@ class DeciderGraphNavigator:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            try:
-                from decider.infer import Decider
-            except ImportError as error:  # pragma: no cover - dependency environment
-                raise RuntimeError(
-                    "Decider graph discovery requires the decider-ai package; "
-                    "install it with the project dependencies first"
-                ) from error
-            self._client = Decider(self.model_name)
+            self._client = create_choice_decider_client(
+                self.backend, self.model_name, device=self.device
+            )
         return self._client
 
 
@@ -445,6 +451,130 @@ def format_search_history(
         lines.extend(f"- {candidate.describe(graph)}" for candidate in result.signals)
     else:
         lines.append("The graph search collected no signals.")
+    return "\n".join(lines)
+
+
+def format_explored_schema_view(
+    result: GraphDiscoveryResult,
+    graph: SchemaGraph,
+    *,
+    forced_root: str | None = None,
+) -> str:
+    """Summarize schema parts exposed during search without model choices/probabilities."""
+    root_tables: set[str] = set()
+    expanded_root_tables: set[str] = set()
+    visited_tables: set[str] = set()
+    relationships: set[tuple[str, str, str, str]] = set()
+    traversed_relationships: set[tuple[str, str, str, str]] = set()
+    attributes: set[tuple[tuple[str, ...], str, str]] = set()
+
+    for event in result.trace:
+        path = event.get("current_path")
+        if isinstance(path, list) and all(isinstance(table, str) for table in path):
+            visited_tables.update(path)
+
+        actions = event.get("legal_actions", [])
+        if isinstance(actions, list):
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                kind = action.get("kind")
+                target_table = action.get("target_table")
+                if kind == "start" and isinstance(target_table, str):
+                    root_tables.add(target_table)
+                if kind == "traverse":
+                    edge = action.get("edge")
+                    if isinstance(edge, dict) and all(
+                        isinstance(edge.get(field), str)
+                        for field in (
+                            "source_table", "source_column",
+                            "target_table", "target_column",
+                        )
+                    ):
+                        relationships.add((
+                            edge["source_table"], edge["source_column"],
+                            edge["target_table"], edge["target_column"],
+                        ))
+                if kind == "select_attribute":
+                    candidate = action.get("candidate")
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_path = candidate.get("path")
+                    table = candidate.get("attribute_table")
+                    column = candidate.get("attribute_column")
+                    if (
+                        isinstance(candidate_path, list)
+                        and all(isinstance(item, str) for item in candidate_path)
+                        and isinstance(table, str)
+                        and isinstance(column, str)
+                    ):
+                        attributes.add((tuple(candidate_path), table, column))
+
+        expanded = event.get("expanded_actions", [])
+        if isinstance(expanded, list):
+            for action in expanded:
+                if not isinstance(action, dict):
+                    continue
+                kind = action.get("kind")
+                target_table = action.get("target_table")
+                if kind == "start" and isinstance(target_table, str):
+                    expanded_root_tables.add(target_table)
+                if kind == "traverse":
+                    edge = action.get("edge")
+                    if isinstance(edge, dict) and all(
+                        isinstance(edge.get(field), str)
+                        for field in (
+                            "source_table", "source_column",
+                            "target_table", "target_column",
+                        )
+                    ):
+                        traversed_relationships.add((
+                            edge["source_table"], edge["source_column"],
+                            edge["target_table"], edge["target_column"],
+                        ))
+
+    lines = ["Schema context seen by graph search:"]
+    if forced_root is not None:
+        lines.append(f"Starting table used: {forced_root}")
+    elif root_tables:
+        lines.append("Starting table options offered: " + ", ".join(sorted(root_tables)))
+        if expanded_root_tables:
+            lines.append(
+                "Starting table branches explored: "
+                + ", ".join(sorted(expanded_root_tables))
+            )
+    lines.append(
+        "Tables visited: " + (", ".join(sorted(visited_tables)) if visited_tables else "none")
+    )
+    lines.append("Foreign-key relationships offered at visited states:")
+    if relationships:
+        lines.extend(
+            f"- {source_table}.{source_column} references {target_table}.{target_column}"
+            for source_table, source_column, target_table, target_column in sorted(relationships)
+        )
+    else:
+        lines.append("- none")
+    lines.append("Foreign-key relationships traversed by the search:")
+    if traversed_relationships:
+        lines.extend(
+            f"- {source_table}.{source_column} references {target_table}.{target_column}"
+            for source_table, source_column, target_table, target_column
+            in sorted(traversed_relationships)
+        )
+    else:
+        lines.append("- none")
+    lines.append("Attribute choices shown at visited search states:")
+    if attributes:
+        lines.extend(
+            f"- {' → '.join(path)}: {table}.{column}"
+            for path, table, column in sorted(attributes)
+        )
+    else:
+        lines.append("- none")
+    lines.append(
+        "The listed attributes are schema context only. Each offered signal contains "
+        "only its own displayed path and explicitly named endpoint."
+    )
     return "\n".join(lines)
 
 
@@ -488,6 +618,21 @@ class _CandidateCatalog:
         self, source_table: str, path: tuple[str, ...]
     ) -> SignalCandidate | None:
         return self._relationships.get((source_table, path))
+
+    def has_content_below(self, source_table: str, path: tuple[str, ...]) -> bool:
+        """Whether this path can lead to an uncollapsed candidate.
+
+        This prevents feature-collapsed graph discovery from traversing beyond
+        a root when the catalog intentionally contains direct attributes only.
+        """
+        for root, candidate_path in (*self._attributes, *self._relationships):
+            if (
+                root == source_table
+                and len(candidate_path) >= len(path)
+                and candidate_path[: len(path)] == path
+            ):
+                return True
+        return False
 
 
 def _top_actions(
@@ -555,6 +700,9 @@ def _format_navigation_context(
         "You are navigating a relational database schema to discover useful signals "
         "for a retrieval or ranking task.",
         "Choose only one offered action. Do not invent tables, attributes, joins, or paths.",
+        "A relationship-only signal represents the association along its path; "
+        "it does not bundle attributes from reached tables. Select a separate "
+        "attribute action when that attribute is the intended evidence.",
         "The program validates and executes your choice before the next decision.",
         "",
         f"User intent: {intent}",

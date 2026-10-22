@@ -9,19 +9,42 @@ compare the model rather than a different candidate-generation procedure.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from math import exp
+import random
 from typing import Any, Iterable, Mapping, Protocol, Sequence, TypeVar
 
 from src.schema.schema_graph import SchemaGraph
 from src.signals.candidates import SignalCandidate
 
 __all__ = [
+    "DECIDER_BACKENDS",
     "DeciderSignalScorer",
     "MiniLMCrossEncoderScorer",
-    "Qwen3RerankerScorer",
+    "RandomSignalScorer",
     "ScoredSignal",
     "SignalScorer",
+    "create_choice_decider_client",
+    "default_decider_model",
 ]
+
+
+# The sole supported typed-choice backend exposes a categorical decision and a
+# calibrated probability for every offered option.
+DECIDER_BACKENDS = ("strands",)
+_DEFAULT_DECIDER_MODELS = {
+    "strands": "StrandsAgents/strands-decider-E4B-gemma4-v1-2610",
+}
+
+
+def default_decider_model(backend: str) -> str:
+    """Return the documented default checkpoint for a typed-choice backend."""
+    try:
+        return _DEFAULT_DECIDER_MODELS[backend]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported Decider backend {backend!r}; expected one of {DECIDER_BACKENDS}"
+        ) from error
 
 @dataclass(frozen=True)
 class ScoredSignal:
@@ -41,6 +64,27 @@ class ScoredSignal:
                 else {}
             ),
         }
+
+
+class RandomSignalScorer:
+    """Stable random ordering for a reproducible ranking baseline."""
+
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+        self.model_name = "random"
+
+    def score(
+        self,
+        intent: str,
+        candidates: Sequence[SignalCandidate],
+        graph: SchemaGraph,
+    ) -> tuple[ScoredSignal, ...]:
+        del graph
+        digest = hashlib.sha256(f"{self.seed}:{intent}".encode("utf-8")).digest()
+        rng = random.Random(int.from_bytes(digest[:8], "big"))
+        return _sort_scored(
+            [ScoredSignal(candidate, rng.random()) for candidate in candidates]
+        )
 
 
 class SignalScorer(Protocol):
@@ -135,145 +179,31 @@ class MiniLMCrossEncoderScorer:
         self._torch = torch
 
 
-class Qwen3RerankerScorer:
-    """Instruction-aware Qwen3 reranking of each intent/signal pair."""
-
-    def __init__(
-        self,
-        model_name: str = "Qwen/Qwen3-Reranker-4B",
-        *,
-        device: str = "auto",
-        batch_size: int = 8,
-        max_length: int = 8192,
-    ) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if max_length <= 0:
-            raise ValueError("max_length must be positive")
-        self.model_name = model_name
-        self.device_name = device
-        self.batch_size = batch_size
-        self.max_length = max_length
-        self._tokenizer: Any | None = None
-        self._model: Any | None = None
-        self._torch: Any | None = None
-        self._false_token_id: int | None = None
-        self._true_token_id: int | None = None
-
-    def score(
-        self,
-        intent: str,
-        candidates: Sequence[SignalCandidate],
-        graph: SchemaGraph,
-    ) -> tuple[ScoredSignal, ...]:
-        if not candidates:
-            return ()
-        self._load()
-        assert self._tokenizer is not None
-        assert self._model is not None
-        assert self._torch is not None
-        assert self._false_token_id is not None and self._true_token_id is not None
-
-        context = _format_intent_context(intent, candidates, graph)
-        instruction = (
-            "Select whether this schema signal is useful for satisfying the user's "
-            "retrieval or ranking intent, using the schema and relationship paths."
-        )
-        system = (
-            'Judge whether the Document meets the Query and Instruct. Answer only '
-            '"yes" or "no".'
-        )
-        prefix = (
-            f"<|im_start|>system\n{system}<|im_end|>\n"
-            "<|im_start|>user\n"
-        )
-        suffix = (
-            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        )
-        prompts = [
-            prefix
-            + f"<Instruct>: {instruction}\n\n<Query>: {context}\n\n"
-            + f"<Document>: {candidate.describe(graph)}"
-            + suffix
-            for candidate in candidates
-        ]
-
-        scored: list[ScoredSignal] = []
-        for start in range(0, len(candidates), self.batch_size):
-            candidate_batch = candidates[start : start + self.batch_size]
-            prompt_batch = prompts[start : start + self.batch_size]
-            encoded = self._tokenizer(
-                prompt_batch,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                add_special_tokens=False,
-                return_tensors="pt",
-            ).to(self._model.device)
-            with self._torch.inference_mode():
-                logits = self._model(**encoded).logits[:, -1, :]
-            binary_logits = self._torch.stack(
-                [
-                    logits[:, self._false_token_id],
-                    logits[:, self._true_token_id],
-                ],
-                dim=1,
-            )
-            log_probabilities = self._torch.log_softmax(binary_logits, dim=1)
-            probabilities = log_probabilities[:, 1].exp().tolist()
-            ranking_logits = (
-                binary_logits[:, 1] - binary_logits[:, 0]
-            ).tolist()
-            scored.extend(
-                ScoredSignal(candidate, float(probability), float(logit))
-                for candidate, probability, logit in zip(
-                    candidate_batch, probabilities, ranking_logits, strict=True
-                )
-            )
-        return _sort_scored(scored)
-
-    def _load(self) -> None:
-        if self._model is not None:
-            return
-        try:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError as error:  # pragma: no cover - dependency environment
-            raise RuntimeError(
-                "Qwen3 reranking requires torch and transformers>=4.51; "
-                "install them in the active environment first"
-            ) from error
-        device = _resolve_device(self.device_name, torch)
-        dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
-        self._tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        # The last token's logits are read as yes/no scores; left padding keeps
-        # that position on the final real token for every sequence in a batch.
-        self._tokenizer.padding_side = "left"
-        self._model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, torch_dtype=dtype
-        ).to(device)
-        self._model.eval()
-        self._false_token_id = self._tokenizer.convert_tokens_to_ids("no")
-        self._true_token_id = self._tokenizer.convert_tokens_to_ids("yes")
-        self._torch = torch
-
-
 class DeciderSignalScorer:
-    """Score signals with a local Decider-compatible System One model.
+    """Score signals with a local typed-choice System One model.
 
     The model makes one categorical choice among the supplied signal candidates
     and returns a probability distribution across that exact list. Candidate
-    scores are those selection probabilities, so there can be at most 255
-    candidates in one decision.
+    scores are those selection probabilities. The supported ``strands``
+    backend uses the Strands typed-choice runtime required by its Gemma-4
+    checkpoint.
     """
 
     def __init__(
         self,
-        model_name: str = "Mapika/decider-4b",
+        model_name: str | None = None,
         *,
+        backend: str = "strands",
+        device: str = "auto",
         client: Any | None = None,
     ) -> None:
-        self.model_name = model_name
+        if backend not in DECIDER_BACKENDS:
+            raise ValueError(
+                f"unsupported Decider backend {backend!r}; expected one of {DECIDER_BACKENDS}"
+            )
+        self.backend = backend
+        self.model_name = model_name or default_decider_model(backend)
+        self.device = device
         self._client = client
 
     def score(
@@ -283,6 +213,7 @@ class DeciderSignalScorer:
         graph: SchemaGraph,
         *,
         history_context: str | None = None,
+        explored_schema_context: str | None = None,
     ) -> tuple[ScoredSignal, ...]:
         if not candidates:
             return ()
@@ -291,11 +222,18 @@ class DeciderSignalScorer:
             # the Decider API itself requires at least two options.
             return (ScoredSignal(candidates[0], 1.0),)
         client = self._get_client()
-        state = (
-            _format_history_rerank_context(intent, history_context)
-            if history_context is not None
-            else _format_intent_context(intent, candidates, graph)
-        )
+        if history_context is not None and explored_schema_context is not None:
+            raise ValueError("pass only one graph-rerank context")
+        if explored_schema_context is not None:
+            state = _format_explored_schema_rerank_context(
+                intent, explored_schema_context
+            )
+        elif history_context is not None:
+            # Retain the old explicit context argument for callers that use the
+            # scorer directly. The graph-search pipeline uses the structured view.
+            state = _format_history_rerank_context(intent, history_context)
+        else:
+            state = _format_intent_context(intent, candidates, graph)
         if len(candidates) > 255:
             raise ValueError(
                 "Decider multi-choice mode accepts at most 255 candidates; reduce "
@@ -326,15 +264,118 @@ class DeciderSignalScorer:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            try:
-                from decider.infer import Decider
-            except ImportError as error:  # pragma: no cover - dependency environment
-                raise RuntimeError(
-                    "Decider scoring requires the decider-ai package; install it "
-                    "with the project dependencies first"
-                ) from error
-            self._client = Decider(self.model_name)
+            self._client = create_choice_decider_client(
+                self.backend, self.model_name, device=self.device
+            )
         return self._client
+
+
+class _StrandsChoiceClient:
+    """Adapt Strands' typed-choice API to the small internal ``decide`` protocol.
+
+    Strands accepts many questions over one ``state`` in a single forward pass,
+    sharing the state prefix/KV cache.  The current callers usually ask one
+    question at a time because graph actions depend on the preceding answer,
+    but keeping the adapter batch-capable avoids a different protocol later.
+    """
+
+    def __init__(self, model_name: str, *, device: str = "auto") -> None:
+        try:
+            from strands_decider.infer import load_engine
+        except ImportError as error:  # pragma: no cover - dependency environment
+            raise RuntimeError(
+                "Strands Decider scoring requires the Gemma-4-capable package from "
+                "https://github.com/strands-labs/strands-decider; see the README "
+                "installation command."
+            ) from error
+        self.model_name = model_name
+        self.device = _resolve_strands_device(device)
+        self._engine = load_engine(model_name, device=self.device)
+
+    def decide(
+        self, state: str, questions: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, object]]:
+        if not questions:
+            return []
+        try:
+            from strands_decider.schema import ChoiceQuestion
+        except ImportError as error:  # pragma: no cover - dependency environment
+            raise RuntimeError("Strands Decider is installed incompletely") from error
+
+        typed_questions: dict[str, Any] = {}
+        original_options: dict[str, list[str]] = {}
+        for index, question in enumerate(questions):
+            raw_options = question.get("options")
+            instruction = question.get("question")
+            if not isinstance(instruction, str) or not isinstance(raw_options, Sequence):
+                raise RuntimeError(f"unexpected typed-choice question: {question!r}")
+            options = [str(option) for option in raw_options]
+            if not 2 <= len(options) <= 255:
+                raise ValueError(
+                    "Strands choice decisions require 2 to 255 options; "
+                    f"got {len(options)}"
+                )
+            if len(set(options)) != len(options):
+                raise ValueError("Strands choice options must be unique")
+            name = f"question_{index}"
+            # Stable internal keys protect against the model interpreting a
+            # lengthy human-readable option as an identifier. The descriptions
+            # are still exactly the candidate strings seen by the model.
+            criteria = {
+                f"option_{option_index}": option
+                for option_index, option in enumerate(options)
+            }
+            typed_questions[name] = ChoiceQuestion(
+                instructions=instruction,
+                criteria=criteria,
+            )
+            original_options[name] = options
+
+        response = self._engine.ask(state, typed_questions)
+        answers: list[dict[str, object]] = []
+        for name, options in original_options.items():
+            answer = response.answers[name]
+            raw_probabilities = getattr(answer, "probabilities", None)
+            raw_choice = getattr(answer, "choice", None)
+            if not isinstance(raw_probabilities, Mapping) or not isinstance(raw_choice, str):
+                raise RuntimeError(f"Strands returned a non-choice answer: {answer!r}")
+            probabilities = {
+                option: float(raw_probabilities.get(f"option_{index}", 0.0))
+                for index, option in enumerate(options)
+            }
+            choice_index = raw_choice.removeprefix("option_")
+            if not choice_index.isdigit() or int(choice_index) >= len(options):
+                raise RuntimeError(f"Strands selected an invalid option: {raw_choice!r}")
+            answers.append(
+                {"choice": options[int(choice_index)], "probs": probabilities}
+            )
+        return answers
+
+
+def create_choice_decider_client(
+    backend: str,
+    model_name: str | None = None,
+    *,
+    device: str = "auto",
+) -> Any:
+    """Load a local typed-choice client for the selected backend."""
+    resolved_model = model_name or default_decider_model(backend)
+    if backend == "strands":
+        return _StrandsChoiceClient(resolved_model, device=device)
+    raise ValueError(
+        f"unsupported Decider backend {backend!r}; expected one of {DECIDER_BACKENDS}"
+    )
+
+
+def _resolve_strands_device(device: str) -> str:
+    """Map the shared CLI device option to Strands' explicit device names."""
+    if device != "auto":
+        return device
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - dependency environment
+        return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _answers(result: Any) -> Sequence[Mapping[str, Any]]:
@@ -388,7 +429,11 @@ def _format_intent_context(
         "retrieval or ranking task. Use the schema and relationship paths below "
         "to interpret each candidate. A path shows how its attribute or related "
         "table is reached by joining tables. Choose based on the user's intent; "
-        "do not assume that a particular table is always the query entity.\n\n"
+        "do not assume that a particular table is always the query entity. "
+        "Each candidate description defines exactly what its signal contains. "
+        "A relationship-only candidate represents only the association along its "
+        "path; it does not include attributes from reached tables unless the "
+        "candidate explicitly names one.\n\n"
         f"Schema:\n{_describe_schema(candidates, graph)}\n\n"
         f"User intent: {intent}"
     )
@@ -404,8 +449,27 @@ def _format_history_rerank_context(intent: str, history_context: str) -> str:
         "and the recorded graph-search history to order them by usefulness. Do not "
         "invent or add signals, and do not assume that an unlisted signal was found.\n\n"
         f"User intent: {intent}\n\n"
-        f"Graph-search history:\n{history_context}\n\n"
-        "Which one of the offered signals is most useful for satisfying the intent?"
+        f"Graph-search history:\n{history_context}"
+    )
+
+
+def _format_explored_schema_rerank_context(
+    intent: str, explored_schema_context: str
+) -> str:
+    """Rank the shortlist using an explored schema view, without search choices."""
+    if not explored_schema_context.strip():
+        raise ValueError("explored_schema_context must not be empty")
+    return (
+        "You are ranking only the candidate signals supplied as options after a "
+        "constrained graph search. Use the intent, the explored schema view, and "
+        "each option's explicit signal definition to rank them by usefulness. "
+        "The schema view is background context; it does not add information to a "
+        "candidate signal. A relationship-only option represents only its stated "
+        "association or connected rows, not attributes of the reached table. "
+        "Count an attribute as part of a signal only when that option explicitly "
+        "names it. Do not invent or add signals.\n\n"
+        f"User intent: {intent}\n\n"
+        f"Explored schema view:\n{explored_schema_context}"
     )
 
 

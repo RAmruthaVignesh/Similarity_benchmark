@@ -52,7 +52,7 @@ For each condition, assign one decision:
 
 Base the assessment on fields and relationships actually present. Do not assume that an unstructured text field reliably supports a specific attribute, or that recorded reviews represent every customer interaction.
 
-Do not rewrite, improve, shorten, rank, or drop any condition. Copy id, result_entity_type, intent_family, and intent exactly. Add only decision and a brief reason. Return exactly 5 JSONL objects and no other text.
+Do not rewrite, improve, shorten, rank, or drop any condition. Copy id and condition exactly. Add only decision and a brief reason. Return exactly 5 JSONL objects and no other text.
 
 The five generated JSONL condition objects follow:
 ```

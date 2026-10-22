@@ -16,13 +16,17 @@ from src.synthetic.controlled_signal_benchmark_v2 import (  # noqa: E402
     build_controlled_signal_benchmark,
 )
 
+DEFAULT_OUTPUT_ROOT = (
+    REPO_ROOT / "benchmarks" / "controlled-signal-discovery" / "rel-amazon-v2"
+)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=REPO_ROOT / "data" / "synthetic" / "controlled-rel-amazon-signals-v2",
+        default=DEFAULT_OUTPUT_ROOT,
         help="directory to create or regenerate",
     )
     parser.add_argument(

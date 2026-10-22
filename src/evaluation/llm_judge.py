@@ -1,8 +1,9 @@
-"""Blinded, schema-only LLM relevance judgments using offline vLLM.
+"""Blinded, schema-only LLM relevance judgments.
 
-The runtime dependency on vLLM is intentionally imported only when a model is
+Local models are served by offline vLLM. OCI-hosted models are called through
+WayFlow, with dependencies imported only when the corresponding backend is
 created. Prompt construction, response parsing, cache keys, and metrics can
-therefore be tested without a GPU or model download.
+therefore be tested without a GPU, model download, or OCI credentials.
 """
 
 from __future__ import annotations
@@ -15,8 +16,103 @@ from typing import Any, Iterable, Mapping, Sequence
 from src.schema.schema_graph import SchemaGraph
 from src.signals.candidates import SignalCandidate
 
-JUDGE_PROMPT_VERSION = "signal-relevance-v2"
-RUBRIC_VERSION = "signal-relevance-1"
+JUDGE_PROMPT_VERSION = "signal-relevance-v7"
+RUBRIC_VERSION = "signal-evidence-rubric-1"
+PROMPT_VARIANTS = ("standard", "paraphrase-a", "paraphrase-b")
+
+_SYSTEM_PROMPT_VARIANTS = {
+    "standard": (
+        "You are an impartial evaluator of relational-schema signals. Judge one "
+        "candidate for one retrieval or ranking intent.\n\n"
+        "Evidence limits: Use only the supplied schema, declared relationships, "
+        "intent, and candidate. Do not assume records, values, distributions, or "
+        "hidden fields. A signal is evidence a downstream retrieval or ranking "
+        "model can use, not a complete retrieval procedure; it need not itself "
+        "compare records, aggregate values, or rank results.\n\n"
+        "Assessment: Infer the sought records from the intent when it says what "
+        "is being sought; do not assume a separate target type. Assess the "
+        "candidate's source, every relationship in its displayed path, and its "
+        "endpoint together. Account for a route that does not fit the intent.\n\n"
+        "Candidate meaning: The technical definition and plain-language "
+        "explanation describe the same signal. The explanation restates its "
+        "source, path, and endpoint; it is a clearer rendering, not extra "
+        "evidence. A relationship-only signal supplies only the association or "
+        "connected-row information along its displayed path. It does not include "
+        "attributes of reached tables unless an attribute is explicitly named as "
+        "the endpoint. Other schema attributes are context only. Do not assume "
+        "omitted joins, values, aggregation, or comparisons.\n\n"
+        "Route interpretation: A direct attribute of the records named in the "
+        "intent can be useful even with zero hops. An indirect route is not "
+        "automatically irrelevant, and hop count alone is neither a benefit nor "
+        "a penalty. Do not infer a method, rank, score, or provenance beyond the "
+        "displayed candidate path."
+    ),
+    "paraphrase-a": (
+        "Act as a neutral reviewer of relational-schema evidence. Give a "
+        "relevance judgment for this one proposed signal and this one "
+        "retrieval/ranking request.\n\n"
+        "Use only the schema, its declared links, the request, and the candidate "
+        "provided here. No row contents, field values, distributions, or "
+        "unlisted fields may be presumed. The signal is a piece of evidence a "
+        "retrieval or ranking system could consume, not the whole system: it "
+        "does not have to perform comparisons, aggregation, or ranking itself.\n\n"
+        "First determine from the request which records are wanted; there is no "
+        "separate target-entity label to assume. Then judge the source entity, "
+        "each link in the candidate's path, and its endpoint as one definition. "
+        "A route that points to the wrong population can weaken its relevance.\n\n"
+        "The technical form and plain-language form are two renderings of one "
+        "candidate. The plain-language form restates the same source, path, and "
+        "endpoint; it does not add evidence. If the candidate ends in a "
+        "relationship rather than a named attribute, count only the association "
+        "or connected-row information on that path—not attributes from tables "
+        "it reaches. Attributes elsewhere in the schema do not become part of "
+        "the candidate. Do not fill in missing joins or presume values, "
+        "aggregates, or comparisons.\n\n"
+        "A zero-hop attribute on the records requested can still be useful. A "
+        "multi-hop signal is not irrelevant just because it is indirect, and "
+        "path length by itself should not raise or lower its grade. Do not add "
+        "a method, ranking, score, or provenance that the displayed path does "
+        "not specify."
+    ),
+    "paraphrase-b": (
+        "Review a single schema signal for its usefulness to one user intent, "
+        "remaining impartial. The intent describes a retrieval or ranking task.\n\n"
+        "Ground the judgment solely in the given schema and declared "
+        "relationships, the intent, and the candidate. Do not rely on example "
+        "rows, assumed values or distributions, or fields not shown. Treat the "
+        "signal as input evidence for a downstream retriever or ranker, not as "
+        "a self-contained retrieval algorithm; it need not compare or aggregate "
+        "records or produce ranked results on its own.\n\n"
+        "Read the intent to identify the requested records rather than supplying "
+        "a separate target type. Relevance depends on the candidate's starting "
+        "entity, the full displayed relationship route, and its endpoint, "
+        "considered together. A route whose source or population is mismatched "
+        "to the request is a reason to lower relevance.\n\n"
+        "The technical definition and its plain-language explanation refer to "
+        "one and the same signal; the explanation only restates the source, "
+        "route, and endpoint in readable words. For a relationship-only "
+        "candidate, the evidence is the association or connected rows along the "
+        "route. Do not credit attributes of a reached table unless that "
+        "attribute is explicitly the endpoint. The rest of the schema is context, "
+        "not extra candidate content. Never supply an omitted join, field value, "
+        "aggregation, or comparison.\n\n"
+        "An attribute on the requested records may be relevant with no joins. "
+        "Indirect routes are not disqualified by their length: hop count alone "
+        "is not evidence for or against relevance. Do not claim methods, scores, "
+        "rankings, or path provenance beyond what the candidate states."
+    ),
+}
+
+_SHARED_RUBRIC_AND_OUTPUT = (
+    "Relevance grades: 0 = no plausible useful evidence for the intent; "
+    "1 = only weak or indirect evidence; 2 = meaningfully useful evidence, "
+    "but incomplete, noisy, general, or not central; 3 = central and direct "
+    "evidence for the intent. Apply these grades considering the intent and "
+    "complete path. Use unable_to_judge only when the schema and intent "
+    "genuinely do not allow a relevance decision. Return a short, "
+    "schema-grounded reason. Do not include private reasoning or extra fields. "
+    "Return only the required top-level JSON object."
+)
 
 JUDGE_OUTPUT_SCHEMA = {
     "type": "object",
@@ -48,23 +144,21 @@ class JudgeModelProfile:
 
 SUPPORTED_MODELS = {
     "mistral": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-    "qwen3.8-27b-fp8": "Qwen/Qwen3.8-27B-FP8",
-    "qwen3.6-35b-a3b-fp8": "Qwen/Qwen3.6-35B-A3B-FP8",
     "muse-glimmer-30b": "meta-models/Muse-Glimmer-30B",
-    "glm-4.7-flash": "zai-org/GLM-4.7-Flash",
     "gemma-4-31b": "google/gemma-4-31B-it",
+    "gpt-oss-120b": "openai/gpt-oss-120b",
+    "gpt-6-luna": "openai.gpt-6-luna",
 }
+
+# These names refer to model-serving backends rather than model capability.
+# Keeping this explicit prevents an OCI model from accidentally going through
+# vLLM (or causing a Hugging Face download) just because it is in
+# SUPPORTED_MODELS.
+OCI_WAYFLOW_MODELS = frozenset({"gpt-6-luna"})
+LOCAL_VLLM_MODELS = frozenset(set(SUPPORTED_MODELS) - OCI_WAYFLOW_MODELS)
 
 MODEL_PROFILES = {
     "mistral": JudgeModelProfile(SUPPORTED_MODELS["mistral"], 1, 0.90),
-    # Both FP8 Qwen checkpoints fit comfortably on one 80 GB H100 at this
-    # short context length. Retain space for KV cache and batching.
-    "qwen3.8-27b-fp8": JudgeModelProfile(
-        SUPPORTED_MODELS["qwen3.8-27b-fp8"], 1, 0.85, default_max_num_seqs=64
-    ),
-    "qwen3.6-35b-a3b-fp8": JudgeModelProfile(
-        SUPPORTED_MODELS["qwen3.6-35b-a3b-fp8"], 1, 0.85, default_max_num_seqs=64
-    ),
     # The official BF16 checkpoints are approximately 60--63 GB.  They fit on
     # one 80 GB H100 for this short JSON-judging prompt, but only with a
     # deliberately small KV-cache budget.  A 2k context cap and four active
@@ -74,13 +168,16 @@ MODEL_PROFILES = {
         SUPPORTED_MODELS["muse-glimmer-30b"], 1, 0.92,
         default_max_model_len=2048, default_max_num_seqs=4,
     ),
-    "glm-4.7-flash": JudgeModelProfile(
-        SUPPORTED_MODELS["glm-4.7-flash"], 1, 0.92,
-        default_max_model_len=2048, default_max_num_seqs=4,
-    ),
     "gemma-4-31b": JudgeModelProfile(
         SUPPORTED_MODELS["gemma-4-31b"], 1, 0.92,
         default_max_model_len=2048, default_max_num_seqs=4,
+    ),
+    # The official MXFP4 checkpoint is 60.8 GiB and is designed to fit on one
+    # 80 GB H100. Keep context and concurrency conservative to leave room for
+    # runtime allocations and the KV cache during local judging.
+    "gpt-oss-120b": JudgeModelProfile(
+        SUPPORTED_MODELS["gpt-oss-120b"], 1, 0.90,
+        default_max_model_len=2048, default_max_num_seqs=8,
     ),
 }
 REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh")
@@ -99,6 +196,7 @@ class JudgeConfig:
     max_tokens: int = 256
     temperature: float = 0.0
     reasoning_effort: str = "none"
+    prompt_variant: str = "standard"
 
 
 def describe_schema(
@@ -133,25 +231,18 @@ def build_judge_prompt(
     candidate: SignalCandidate,
     graph: SchemaGraph,
     schema_description: str,
+    *,
+    prompt_variant: str = "standard",
 ) -> list[dict[str, str]]:
-    """Build one method-blind condition/signal judgment prompt."""
-    system = (
-        "You are an impartial evaluator for relational-schema signal discovery. "
-        "Judge one proposed signal for one retrieval or ranking intent. "
-        "Use only the stated schema, relationships, intent, and candidate; do not "
-        "assume data values, distributions, or hidden fields. Do not infer a method, "
-        "rank, score, or provenance beyond the displayed candidate path.\n\n"
-        "Relevance grades: 0 = irrelevant; 1 = weak or indirect; "
-        "2 = useful but not central; 3 = direct or central. "
-        "Use unable_to_judge only when the schema and intent genuinely do not allow "
-        "a relevance decision. Return a short, schema-grounded reason. Do not "
-        "include private reasoning or extra fields. Return only the required "
-        "top-level JSON object."
-    )
+    """Build one method-blind prompt from full, equivalent instruction variants."""
+    if prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(f"unsupported prompt variant {prompt_variant!r}; choose from {PROMPT_VARIANTS}")
+    system = f"{_SYSTEM_PROMPT_VARIANTS[prompt_variant]}\n\n{_SHARED_RUBRIC_AND_OUTPUT}"
     user = (
         f"Schema:\n{schema_description}\n\n"
         f"User intent:\n{condition}\n\n"
-        f"Candidate signal:\n{candidate.describe(graph)}\n\n"
+        f"Candidate signal — technical definition:\n{candidate.describe(graph)}\n\n"
+        f"Plain-language explanation of the same signal:\n{candidate.explain_for_human(graph)}\n\n"
         "Return exactly one top-level JSON object with exactly these fields: "
         "status, grade, and reason. For status=judged, grade must be an integer "
         "from 0 to 3. For status=unable_to_judge, grade must be null. Do not "
@@ -168,26 +259,16 @@ def chat_template_kwargs(model_family: str, reasoning_effort: str) -> dict[str, 
             f"choose one of {', '.join(REASONING_EFFORTS)}"
         )
     if reasoning_effort == "none":
-        if model_family in {"qwen3.8-27b-fp8", "qwen3.6-35b-a3b-fp8"}:
-            return {"enable_thinking": False}
         return {}
-    if model_family == "qwen3.8-27b-fp8":
-        # Qwen 3.8 natively accepts low/medium/xhigh. Its documented maximum
-        # effort is xhigh, so map the generic high option to that level.
-        return {
-            "enable_thinking": True,
-            "reasoning_effort": "xhigh" if reasoning_effort == "high" else reasoning_effort,
-            "preserve_thinking": False,
-        }
-    if model_family == "qwen3.6-35b-a3b-fp8":
-        # The published Qwen 3.6 interface exposes thinking as an on/off
-        # template option, not distinct effort levels.
-        if reasoning_effort != "medium":
+    if model_family == "gpt-oss-120b":
+        if reasoning_effort not in {"low", "medium", "high"}:
             raise ValueError(
-                "Qwen 3.6 supports --reasoning-effort none (direct) or medium "
-                "(thinking enabled); it has no documented graded effort control"
+                "GPT-OSS supports --reasoning-effort none, low, medium, or high"
             )
-        return {"enable_thinking": True, "preserve_thinking": False}
+        # GPT-OSS's Harmony chat template represents this setting in its
+        # system message. The default is none: concise structured labels do
+        # not need to spend their fixed generation budget on a long CoT.
+        return {"reasoning_effort": reasoning_effort}
     raise ValueError(
         f"{model_family} does not expose a supported reasoning-effort control; "
         "use --reasoning-effort none"
@@ -263,6 +344,7 @@ def cache_key(
         "seed": config.seed,
         "temperature": config.temperature,
         "reasoning_effort": config.reasoning_effort,
+        "prompt_variant": config.prompt_variant,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -285,7 +367,7 @@ def schema_version(
 
 def create_vllm(model_family: str, model_name: str, model_revision: str, **kwargs: Any) -> Any:
     """Create an offline vLLM engine with the vendor-recommended Mistral mode."""
-    if model_family not in SUPPORTED_MODELS:
+    if model_family not in LOCAL_VLLM_MODELS:
         raise ValueError(f"unsupported judge model family: {model_family}")
     try:
         from vllm import LLM
@@ -306,6 +388,84 @@ def create_vllm(model_family: str, model_name: str, model_revision: str, **kwarg
             "load_format": "mistral",
         })
     return LLM(**options)
+
+
+def create_oci_wayflow_judge(
+    *,
+    model_name: str,
+    compartment_id: str,
+    config_path: str,
+    profile: str,
+    region: str,
+    max_tokens: int,
+    seed: int,
+    reasoning_effort: str,
+) -> Any:
+    """Create a WayFlow OCI GenAI judge using the caller's OCI config file."""
+    try:
+        from wayflowcore.models import LlmGenerationConfig, OCIGenAIModel
+        from wayflowcore.models.ociclientconfig import OCIClientConfigWithApiKey
+    except ImportError as error:
+        raise RuntimeError(
+            "GPT-6 Luna judging requires wayflowcore and the OCI SDK in the "
+            "SimBench environment."
+        ) from error
+
+    extra_args: dict[str, Any] = {"seed": seed}
+    if reasoning_effort != "none":
+        extra_args["reasoning_effort"] = reasoning_effort.upper()
+    endpoint = f"https://inference.generativeai.{region}.oci.oraclecloud.com"
+    client_config = OCIClientConfigWithApiKey(
+        service_endpoint=endpoint,
+        auth_profile=profile,
+        _auth_file_location=config_path,
+    )
+    return OCIGenAIModel(
+        model_id=model_name,
+        compartment_id=compartment_id,
+        client_config=client_config,
+        # GPT-6 Luna's OCI endpoint only accepts its provider default
+        # temperature. Do not send temperature=0, which OCI rejects.
+        generation_config=LlmGenerationConfig(max_tokens=max_tokens, extra_args=extra_args),
+    )
+
+
+def make_wayflow_judge_prompt(messages: Sequence[Mapping[str, str]]) -> Any:
+    """Translate judge messages into a WayFlow prompt with strict JSON output."""
+    try:
+        from wayflowcore.messagelist import Message
+        from wayflowcore.models import Prompt
+        from wayflowcore.property import (
+            IntegerProperty,
+            NullProperty,
+            ObjectProperty,
+            StringProperty,
+            UnionProperty,
+        )
+    except ImportError as error:
+        raise RuntimeError("GPT-6 Luna judging requires wayflowcore") from error
+
+    response_format = ObjectProperty(
+        name="signal_judgment",
+        properties={
+            "status": StringProperty(
+                description="Either judged or unable_to_judge."
+            ),
+            "grade": UnionProperty(
+                any_of=[IntegerProperty(), NullProperty()],
+                description="A relevance grade from 0 to 3, or null if unable_to_judge.",
+            ),
+            "reason": StringProperty(description="A short schema-grounded reason."),
+        },
+        additional_properties=False,
+    )
+    return Prompt(
+        messages=[
+            Message(role=message["role"], content=message["content"])
+            for message in messages
+        ],
+        response_format=response_format,
+    )
 
 
 def make_sampling_params(config: JudgeConfig) -> Any:

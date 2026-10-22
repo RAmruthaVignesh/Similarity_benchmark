@@ -17,14 +17,14 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.datasets.local_relbench_dataset import LocalRelBenchDataset  # noqa: E402
 from src.schema.schema_graph import SchemaGraph  # noqa: E402
-from src.signals.candidates import enumerate_signal_candidates  # noqa: E402
+from src.signals.candidates import candidate_from_dict, enumerate_signal_candidates  # noqa: E402
 from src.signals.graph_navigation import (  # noqa: E402
     DeciderGraphNavigator,
     format_search_history,
 )
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
-    Qwen3RerankerScorer,
+    RandomSignalScorer,
     _ranking_logits,
     _format_intent_context,
 )
@@ -165,6 +165,30 @@ tables:
             "attribute:product:product>review:review.product_id", identifiers
         )
 
+    def test_human_signal_explanation_and_diagram_preserve_the_path(self):
+        candidate = next(
+            value
+            for value in enumerate_signal_candidates(
+                self.dataset, self.graph, source_tables=["customer"], max_hops=2
+            )
+            if value.id == "attribute:customer:customer>review>product:product.title"
+        )
+
+        self.assertEqual(
+            candidate.explain_for_human(self.graph),
+            "Start from a customer, follow their reviews to the products they reviewed, "
+            "and use those products' titles as the signal.",
+        )
+        self.assertEqual(
+            candidate.human_diagram(self.graph),
+            "customer\n"
+            "   └─ reviews, linked by customer_id\n"
+            "      └─ products, linked by product_id\n"
+            "         └─ product.title",
+        )
+        restored = candidate_from_dict(candidate.to_dict(self.graph))
+        self.assertEqual(restored, candidate)
+
     def test_hop_limit_and_source_table_bound_the_candidate_set(self):
         candidates = enumerate_signal_candidates(
             self.dataset, self.graph, source_tables=["product"], max_hops=0
@@ -172,6 +196,25 @@ tables:
         self.assertTrue(candidates)
         self.assertTrue(all(candidate.source_table == "product" for candidate in candidates))
         self.assertTrue(all(candidate.hops == 0 for candidate in candidates))
+
+    def test_feature_collapsed_catalog_keeps_one_direct_attribute_per_column(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset,
+            self.graph,
+            max_hops=2,
+            catalog_view="feature-collapsed",
+        )
+        identifiers = [candidate.id for candidate in candidates]
+        self.assertIn("attribute:product:product:product.title", identifiers)
+        self.assertIn("attribute:review:review:review.rating", identifiers)
+        self.assertIn("attribute:customer:customer:customer.reviewer_name", identifiers)
+        self.assertTrue(all(candidate.kind == "attribute" for candidate in candidates))
+        self.assertTrue(all(candidate.hops == 0 for candidate in candidates))
+        self.assertTrue(
+            all(candidate.source_table == candidate.attribute_table for candidate in candidates)
+        )
+        self.assertNotIn("attribute:product:product>review:review.rating", identifiers)
+        self.assertNotIn("relationship:product:product>review", identifiers)
 
     def test_get_column_names_reads_parquet_schema_without_loading_table(self):
         with patch.object(
@@ -191,6 +234,23 @@ tables:
         scored = scorer.score("Find affordable products", candidates, self.graph)
         self.assertEqual(scored[0].score, 0.8)
         self.assertEqual(len(scored), len(candidates))
+
+    def test_random_baseline_is_reproducible_and_seeded(self):
+        candidates = enumerate_signal_candidates(
+            self.dataset, self.graph, source_tables=["product"], max_hops=1
+        )
+        first = RandomSignalScorer(seed=17).score("Find useful products", candidates, self.graph)
+        repeated = RandomSignalScorer(seed=17).score("Find useful products", candidates, self.graph)
+        other_seed = RandomSignalScorer(seed=18).score("Find useful products", candidates, self.graph)
+
+        self.assertEqual(
+            [item.candidate.id for item in first],
+            [item.candidate.id for item in repeated],
+        )
+        self.assertNotEqual(
+            [item.candidate.id for item in first],
+            [item.candidate.id for item in other_seed],
+        )
 
     def test_decider_graph_reranking_uses_search_history_not_full_schema(self):
         candidates = enumerate_signal_candidates(
@@ -226,12 +286,6 @@ tables:
         )
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].score, 1.0)
-
-    def test_qwen_reranker_can_be_configured_without_loading_weights(self):
-        scorer = Qwen3RerankerScorer(batch_size=4, max_length=4096)
-        self.assertEqual(scorer.model_name, "Qwen/Qwen3-Reranker-4B")
-        self.assertEqual(scorer.batch_size, 4)
-        self.assertEqual(scorer.max_length, 4096)
 
     def test_decider_prompt_includes_schema_and_readable_paths_without_ids(self):
         candidates = enumerate_signal_candidates(

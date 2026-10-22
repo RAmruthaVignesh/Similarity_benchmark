@@ -1,0 +1,433 @@
+RELAMAZON — SIGNAL CANDIDATES USED FOR CONDITION3 ANNOTATIONS
+========================================================================
+
+39 unique schema-level signals shared across 5 intents: condition-001, condition-002, condition-003, condition-004, condition-005.
+Candidate settings: max 2 hops; starting tables: review, product, customer; structural key columns included: False. 
+This is the candidate pool used in these annotations, not every conceivable or data-derived signal.
+The annotation description is followed by its path diagram and technical definition.
+
+01. ATTRIBUTE
+ID: attribute:customer:customer:customer.customer_name
+Annotation-script description: Start from a customer and use its customer name as the signal.
+Path diagram:
+customer
+   └─ customer.customer_name
+Technical definition: Attribute customer.customer_name; path: customer.
+
+------------------------------------------------------------------------
+
+02. ATTRIBUTE
+ID: attribute:customer:customer>review:review.rating
+Annotation-script description: Start from a customer, follow their reviews, and use those reviews' ratings as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ review.rating
+Technical definition: Attribute review.rating; path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+03. ATTRIBUTE
+ID: attribute:customer:customer>review:review.review_text
+Annotation-script description: Start from a customer, follow their reviews, and use those reviews' review text as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ review.review_text
+Technical definition: Attribute review.review_text; path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+04. ATTRIBUTE
+ID: attribute:customer:customer>review:review.review_time
+Annotation-script description: Start from a customer, follow their reviews, and use those reviews' review times as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ review.review_time
+Technical definition: Attribute review.review_time; path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+05. ATTRIBUTE
+ID: attribute:customer:customer>review:review.summary
+Annotation-script description: Start from a customer, follow their reviews, and use those reviews' summaries as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ review.summary
+Technical definition: Attribute review.summary; path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+06. ATTRIBUTE
+ID: attribute:customer:customer>review:review.verified
+Annotation-script description: Start from a customer, follow their reviews, and use those reviews' verifieds as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ review.verified
+Technical definition: Attribute review.verified; path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+07. ATTRIBUTE
+ID: attribute:customer:customer>review>product:product.brand
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed, and use those products' brands as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ product.brand
+Technical definition: Attribute product.brand; path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+08. ATTRIBUTE
+ID: attribute:customer:customer>review>product:product.category
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed, and use those products' categories as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ product.category
+Technical definition: Attribute product.category; path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+09. ATTRIBUTE
+ID: attribute:customer:customer>review>product:product.description
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed, and use those products' descriptions as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ product.description
+Technical definition: Attribute product.description; path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+10. ATTRIBUTE
+ID: attribute:customer:customer>review>product:product.price
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed, and use those products' prices as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ product.price
+Technical definition: Attribute product.price; path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+11. ATTRIBUTE
+ID: attribute:customer:customer>review>product:product.title
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed, and use those products' titles as the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ product.title
+Technical definition: Attribute product.title; path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+12. ATTRIBUTE
+ID: attribute:product:product:product.brand
+Annotation-script description: Start from a product and use its brand as the signal.
+Path diagram:
+product
+   └─ product.brand
+Technical definition: Attribute product.brand; path: product.
+
+------------------------------------------------------------------------
+
+13. ATTRIBUTE
+ID: attribute:product:product:product.category
+Annotation-script description: Start from a product and use its category as the signal.
+Path diagram:
+product
+   └─ product.category
+Technical definition: Attribute product.category; path: product.
+
+------------------------------------------------------------------------
+
+14. ATTRIBUTE
+ID: attribute:product:product:product.description
+Annotation-script description: Start from a product and use its description as the signal.
+Path diagram:
+product
+   └─ product.description
+Technical definition: Attribute product.description; path: product.
+
+------------------------------------------------------------------------
+
+15. ATTRIBUTE
+ID: attribute:product:product:product.price
+Annotation-script description: Start from a product and use its price as the signal.
+Path diagram:
+product
+   └─ product.price
+Technical definition: Attribute product.price; path: product.
+
+------------------------------------------------------------------------
+
+16. ATTRIBUTE
+ID: attribute:product:product:product.title
+Annotation-script description: Start from a product and use its title as the signal.
+Path diagram:
+product
+   └─ product.title
+Technical definition: Attribute product.title; path: product.
+
+------------------------------------------------------------------------
+
+17. ATTRIBUTE
+ID: attribute:product:product>review:review.rating
+Annotation-script description: Start from a product, follow its reviews, and use those reviews' ratings as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ review.rating
+Technical definition: Attribute review.rating; path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+18. ATTRIBUTE
+ID: attribute:product:product>review:review.review_text
+Annotation-script description: Start from a product, follow its reviews, and use those reviews' review text as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ review.review_text
+Technical definition: Attribute review.review_text; path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+19. ATTRIBUTE
+ID: attribute:product:product>review:review.review_time
+Annotation-script description: Start from a product, follow its reviews, and use those reviews' review times as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ review.review_time
+Technical definition: Attribute review.review_time; path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+20. ATTRIBUTE
+ID: attribute:product:product>review:review.summary
+Annotation-script description: Start from a product, follow its reviews, and use those reviews' summaries as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ review.summary
+Technical definition: Attribute review.summary; path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+21. ATTRIBUTE
+ID: attribute:product:product>review:review.verified
+Annotation-script description: Start from a product, follow its reviews, and use those reviews' verifieds as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ review.verified
+Technical definition: Attribute review.verified; path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+22. ATTRIBUTE
+ID: attribute:product:product>review>customer:customer.customer_name
+Annotation-script description: Start from a product, follow its reviews to the customers who wrote them, and use those customers' customer names as the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ customers, linked by customer_id
+         └─ customer.customer_name
+Technical definition: Attribute customer.customer_name; path: product --product.product_id←review.product_id-- review --review.customer_id→customer.customer_id-- customer.
+
+------------------------------------------------------------------------
+
+23. ATTRIBUTE
+ID: attribute:review:review:review.rating
+Annotation-script description: Start from a review and use its rating as the signal.
+Path diagram:
+review
+   └─ review.rating
+Technical definition: Attribute review.rating; path: review.
+
+------------------------------------------------------------------------
+
+24. ATTRIBUTE
+ID: attribute:review:review:review.review_text
+Annotation-script description: Start from a review and use its review text as the signal.
+Path diagram:
+review
+   └─ review.review_text
+Technical definition: Attribute review.review_text; path: review.
+
+------------------------------------------------------------------------
+
+25. ATTRIBUTE
+ID: attribute:review:review:review.review_time
+Annotation-script description: Start from a review and use its review time as the signal.
+Path diagram:
+review
+   └─ review.review_time
+Technical definition: Attribute review.review_time; path: review.
+
+------------------------------------------------------------------------
+
+26. ATTRIBUTE
+ID: attribute:review:review:review.summary
+Annotation-script description: Start from a review and use its summary as the signal.
+Path diagram:
+review
+   └─ review.summary
+Technical definition: Attribute review.summary; path: review.
+
+------------------------------------------------------------------------
+
+27. ATTRIBUTE
+ID: attribute:review:review:review.verified
+Annotation-script description: Start from a review and use its verified as the signal.
+Path diagram:
+review
+   └─ review.verified
+Technical definition: Attribute review.verified; path: review.
+
+------------------------------------------------------------------------
+
+28. ATTRIBUTE
+ID: attribute:review:review>customer:customer.customer_name
+Annotation-script description: Start from a review, follow the customers who wrote them, and use those customers' customer names as the signal.
+Path diagram:
+review
+   └─ customers, linked by customer_id
+      └─ customer.customer_name
+Technical definition: Attribute customer.customer_name; path: review --review.customer_id→customer.customer_id-- customer.
+
+------------------------------------------------------------------------
+
+29. ATTRIBUTE
+ID: attribute:review:review>product:product.brand
+Annotation-script description: Start from a review, follow the products they reviewed, and use those products' brands as the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ product.brand
+Technical definition: Attribute product.brand; path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+30. ATTRIBUTE
+ID: attribute:review:review>product:product.category
+Annotation-script description: Start from a review, follow the products they reviewed, and use those products' categories as the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ product.category
+Technical definition: Attribute product.category; path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+31. ATTRIBUTE
+ID: attribute:review:review>product:product.description
+Annotation-script description: Start from a review, follow the products they reviewed, and use those products' descriptions as the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ product.description
+Technical definition: Attribute product.description; path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+32. ATTRIBUTE
+ID: attribute:review:review>product:product.price
+Annotation-script description: Start from a review, follow the products they reviewed, and use those products' prices as the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ product.price
+Technical definition: Attribute product.price; path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+33. ATTRIBUTE
+ID: attribute:review:review>product:product.title
+Annotation-script description: Start from a review, follow the products they reviewed, and use those products' titles as the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ product.title
+Technical definition: Attribute product.title; path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+34. RELATIONSHIP
+ID: relationship:customer:customer>review
+Annotation-script description: Start from a customer, follow their reviews; the relationship itself is the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ relationship path
+Technical definition: Relationship path: customer --customer.customer_id←review.customer_id-- review.
+
+------------------------------------------------------------------------
+
+35. RELATIONSHIP
+ID: relationship:customer:customer>review>product
+Annotation-script description: Start from a customer, follow their reviews to the products they reviewed; the relationship path itself is the signal.
+Path diagram:
+customer
+   └─ reviews, linked by customer_id
+      └─ products, linked by product_id
+         └─ relationship path
+Technical definition: Relationship path: customer --customer.customer_id←review.customer_id-- review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------
+
+36. RELATIONSHIP
+ID: relationship:product:product>review
+Annotation-script description: Start from a product, follow its reviews; the relationship itself is the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ relationship path
+Technical definition: Relationship path: product --product.product_id←review.product_id-- review.
+
+------------------------------------------------------------------------
+
+37. RELATIONSHIP
+ID: relationship:product:product>review>customer
+Annotation-script description: Start from a product, follow its reviews to the customers who wrote them; the relationship path itself is the signal.
+Path diagram:
+product
+   └─ reviews, linked by product_id
+      └─ customers, linked by customer_id
+         └─ relationship path
+Technical definition: Relationship path: product --product.product_id←review.product_id-- review --review.customer_id→customer.customer_id-- customer.
+
+------------------------------------------------------------------------
+
+38. RELATIONSHIP
+ID: relationship:review:review>customer
+Annotation-script description: Start from a review, follow the customers who wrote them; the relationship itself is the signal.
+Path diagram:
+review
+   └─ customers, linked by customer_id
+      └─ relationship path
+Technical definition: Relationship path: review --review.customer_id→customer.customer_id-- customer.
+
+------------------------------------------------------------------------
+
+39. RELATIONSHIP
+ID: relationship:review:review>product
+Annotation-script description: Start from a review, follow the products they reviewed; the relationship itself is the signal.
+Path diagram:
+review
+   └─ products, linked by product_id
+      └─ relationship path
+Technical definition: Relationship path: review --review.product_id→product.product_id-- product.
+
+------------------------------------------------------------------------

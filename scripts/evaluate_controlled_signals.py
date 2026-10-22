@@ -22,13 +22,14 @@ from src.schema.schema_graph import SchemaGraph  # noqa: E402
 from src.signals.candidates import SignalCandidate, enumerate_signal_candidates  # noqa: E402
 from src.signals.graph_navigation import (  # noqa: E402
     DeciderGraphNavigator,
-    format_search_history,
+    format_explored_schema_view,
 )
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
     MiniLMCrossEncoderScorer,
-    Qwen3RerankerScorer,
     ScoredSignal,
+    create_choice_decider_client,
+    default_decider_model,
 )
 from src.synthetic.controlled_signal_benchmark_v2 import (  # noqa: E402
     BENCHMARK_VERSION,
@@ -39,7 +40,9 @@ from src.synthetic.controlled_signal_benchmark_v2 import (  # noqa: E402
 )
 from src.synthetic.controlled_signal_metrics import ranking_metrics  # noqa: E402
 
-DEFAULT_ROOT = REPO_ROOT / "data" / "synthetic" / "controlled-rel-amazon-signals-v2"
+DEFAULT_ROOT = (
+    REPO_ROOT / "benchmarks" / "controlled-signal-discovery" / "rel-amazon-v2"
+)
 K_VALUES = (1, 3, 5)
 
 
@@ -62,7 +65,7 @@ def main() -> int:
     parser.add_argument(
         "--scorer",
         action="append",
-        choices=("minilm", "decider", "qwen3-reranker", "random"),
+        choices=("minilm", "strands-decider", "random"),
         required=True,
         help="repeat to compare several methods",
     )
@@ -83,10 +86,13 @@ def main() -> int:
         "decider-graph-reranked-oracle-root",
     }
     oracle_root = args.method == "decider-graph-reranked-oracle-root"
-    if is_graph and scorer_names != ("decider",):
-        parser.error("Decider graph methods require exactly one --scorer decider")
+    typed_deciders = {"strands-decider"}
+    if is_graph and (len(scorer_names) != 1 or scorer_names[0] not in typed_deciders):
+        parser.error(
+            "Decider graph methods require exactly one --scorer strands-decider"
+        )
     if is_graph and args.model_name is None:
-        args.model_name = "Mapika/decider-4b"
+        args.model_name = default_decider_model("strands")
     if oracle_root and args.max_decisions < 2:
         parser.error("oracle-root evaluation requires --max-decisions of at least 2")
     if args.model_name and len(scorer_names) != 1:
@@ -120,16 +126,20 @@ def main() -> int:
         rows = []
         for scorer_name in scorer_names:
             if is_graph:
-                try:
-                    from decider.infer import Decider
-                except ImportError as error:
-                    raise RuntimeError(
-                        "Decider graph reranking requires the decider-ai package"
-                    ) from error
-                shared_decider = Decider(args.model_name)
-                scorer = DeciderSignalScorer(args.model_name, client=shared_decider)
+                backend = _decider_backend(scorer_name)
+                shared_decider = create_choice_decider_client(
+                    backend, args.model_name, device=args.device
+                )
+                scorer = DeciderSignalScorer(
+                    args.model_name,
+                    backend=backend,
+                    device=args.device,
+                    client=shared_decider,
+                )
                 navigator = DeciderGraphNavigator(
                     model_name=args.model_name,
+                    backend=backend,
+                    device=args.device,
                     max_hops=MAX_HOPS,
                     max_decisions=args.max_decisions,
                     branch_width=args.branch_width,
@@ -152,7 +162,7 @@ def main() -> int:
                         graph,
                         start_table=task.source_table if oracle_root else None,
                     )
-                    history_context = format_search_history(
+                    explored_schema_context = format_explored_schema_view(
                         search_result,
                         graph,
                         forced_root=task.source_table if oracle_root else None,
@@ -161,7 +171,7 @@ def main() -> int:
                         task.condition,
                         search_result.signals,
                         graph,
-                        history_context=history_context,
+                        explored_schema_context=explored_schema_context,
                     )
                 score_row = _score_task(
                     output_name, task, ranked, graph, len(candidates), candidates
@@ -169,7 +179,7 @@ def main() -> int:
                 if is_graph:
                     score_row["root_mode"] = "oracle" if oracle_root else "model_selected"
                     score_row["ranking_stage"] = (
-                        "Decider ranking from graph-search history over discovered shortlist"
+                        "Decider ranking from explored schema view over discovered shortlist"
                     )
                     score_row["root_selection"] = _root_selection_record(
                         search_result, task, oracle_root=oracle_root
@@ -247,13 +257,19 @@ def _build_scorer(name: str, args: argparse.Namespace) -> Any | None:
             device=args.device,
             batch_size=args.batch_size,
         )
-    if name == "qwen3-reranker":
-        return Qwen3RerankerScorer(
-            args.model_name or "Qwen/Qwen3-Reranker-4B",
+    if name == "strands-decider":
+        return DeciderSignalScorer(
+            args.model_name or default_decider_model("strands"),
+            backend="strands",
             device=args.device,
-            batch_size=args.batch_size,
         )
-    return DeciderSignalScorer(args.model_name or "Mapika/decider-4b")
+    raise ValueError(f"unsupported scorer: {name}")
+
+
+def _decider_backend(scorer_name: str) -> str:
+    if scorer_name == "strands-decider":
+        return "strands"
+    raise ValueError(f"{scorer_name!r} is not a typed-choice Decider scorer")
 
 
 def _rank(
