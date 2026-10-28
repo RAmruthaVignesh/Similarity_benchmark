@@ -30,9 +30,8 @@ python scripts/build_controlled_signal_benchmark.py \
   --output-root benchmarks/controlled-signal-discovery/rel-amazon-v2
 
 python scripts/evaluate_controlled_signals.py \
-  --scorer random \
-  --scorer minilm \
-  --scorer strands-decider \
+  --method catalog-rank \
+  --model random \
   --benchmark-root benchmarks/controlled-signal-discovery/rel-amazon-v2 \
   --output results/rel-amazon/controlled-signal-discovery/v2/summary.json
 ```
@@ -40,8 +39,8 @@ python scripts/evaluate_controlled_signals.py \
 The summary reports macro nDCG@1/3/5, Recall@1/3/5 for central (grade-3)
 signals, and MRR of the first central signal. The adjacent `*-tasks.jsonl`
 file records the top-ranked signals and per-condition scores for inspection.
-The scorer classes and prompt construction are shared with standard signal
-discovery; only the condition and synthetic qrels differ.
+The backend implementations and prompt construction are shared with standard
+signal discovery; only the condition and synthetic qrels differ.
 
 ## Layout
 
@@ -77,7 +76,8 @@ src/
     schema_graph.py           SchemaGraph: tables and foreign keys as a graph
   signals/
     candidates.py             direct attributes and relational-path candidates
-    scorers.py                MiniLM and Strands Decider backends
+    scorers.py                MiniLM and Strands Decider backend implementations
+    llm_discovery.py          pointwise generative-LLM backend and prompts
   synthetic/
     controlled_signal_benchmark_v2.py  real-schema controlled qrels
 scripts/
@@ -295,7 +295,19 @@ default, while temporal columns remain candidates. Path-only relationship
 candidates are included so a scorer can select a relationship even when no
 single downstream column is decisive.
 
-The same candidate list can be compared with local scoring approaches:
+Signal discovery has two independent settings: a **method** controls how the
+catalog is explored, and a validated **model** profile provides ranking or
+action-selection.
+
+Methods are:
+
+- `catalog-rank`: score every candidate in the fixed catalog and rank it.
+- `graph-search`: select legal graph actions, then rerank only the signals
+  discovered by the search.
+- `graph-search-oracle-root`: the graph-search diagnostic with the initial
+  table fixed by an oracle-root map.
+
+Supported model profiles are:
 
 - `minilm`: a conventional Hugging Face MiniLM cross-encoder. Its sigmoid score
   is a ranking value, not a calibrated relevance probability.
@@ -305,8 +317,8 @@ The same candidate list can be compared with local scoring approaches:
 - `random`: a seeded random ordering over the same enumerated candidate list.
   Use it as a chance baseline; it does not load a model.
 
-`--method decider-graph-reranked --scorer strands-decider` first has the
-Strands Decider explore
+`--method graph-search --model strands-decider` first has the Strands
+Decider explore
 legal graph actions (select a table, emit an attribute/path, traverse one
 foreign key, or stop), then performs a final multi-choice ranking over only the
 discovered shortlist. The final ranking prompt contains the intent and a
@@ -315,7 +327,7 @@ state/action trace is saved with the result. Final choice probabilities are
 conditional on the discovered shortlist; undiscovered signals cannot be
 recovered by the final ranking.
 
-`decider-graph-reranked-oracle-root` uses the same search and reranking process,
+`graph-search-oracle-root` uses the same search and reranking process,
 but fixes the initial table from a condition-to-table JSON mapping. For the
 current RelAmazon conditions-v3 file, `conditions/rel-amazon/oracle-root-map-v3.json`
 maps each condition to the entity type it explicitly asks to retrieve (product,
@@ -361,9 +373,24 @@ given output filename:
 ```bash
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer minilm --catalog-view both \
+  --hop-limit 2 --method catalog-rank --model minilm --catalog-view both \
   --output results/rel-amazon/discovery/minilm.jsonl
 ```
+
+The CLI keeps the **method** independent from the validated **model** profile:
+
+- `catalog-rank` scores every candidate in the selected catalog. It supports
+  `random`, `minilm`, `strands-decider`, and each generative-LLM model profile.
+- `graph-search` programmatically explores legal schema actions and reranks
+  only its discovered shortlist. It supports `strands-decider` and each
+  generative-LLM model profile.
+- `graph-search-oracle-root` is the same graph-search strategy with an
+  externally supplied starting table; use it only as a diagnostic.
+
+Generative profiles such as `muse-glimmer-30b` and `gpt-6-luna` select the
+configured local-vLLM or OCI runner through the same `--model` flag. Raw model
+identifiers are intentionally not accepted: add a validated profile in
+`src/signals/model_registry.py` for a new compatible checkpoint.
 
 Do not compare nDCG across these two catalogs as if they were the same task.
 Compare methods within each view; report both to distinguish feature discovery
@@ -374,7 +401,7 @@ Run the two comparable local scoring baselines:
 ```bash
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer minilm \
+  --hop-limit 2 --method catalog-rank --model minilm \
   --output results/rel-amazon/discovery/minilm-signals.jsonl
 
 # Strands' Gemma-4 typed-choice Decider. --device auto selects CUDA when
@@ -382,33 +409,29 @@ python scripts/discover_signals.py \
 # weights into the configured Hugging Face cache.
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer strands-decider \
-  --model-name StrandsAgents/strands-decider-E4B-gemma4-v1-2610 \
+  --hop-limit 2 --method catalog-rank --model strands-decider \
   --output results/rel-amazon/discovery/strands-decider-e4b-signals.jsonl
 
 # Strands-guided graph discovery followed by reranking from the explored-schema
 # view of only the discovered signals.
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer strands-decider --method decider-graph-reranked \
+  --hop-limit 2 --method graph-search --model strands-decider \
   --max-decisions 12 --branch-width 2 --max-signals 10 \
-  --model-name StrandsAgents/strands-decider-E4B-gemma4-v1-2610 \
   --output results/rel-amazon/discovery/strands-decider-e4b-graph-reranked-signals.jsonl
 
 # Target-entity-proxy root ablation for conditions-v3.
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer strands-decider \
-  --method decider-graph-reranked-oracle-root \
+  --hop-limit 2 --method graph-search-oracle-root --model strands-decider \
   --oracle-root-map conditions/rel-amazon/oracle-root-map-v3.json \
   --max-decisions 30 --branch-width 3 --max-signals 10 \
-  --model-name StrandsAgents/strands-decider-E4B-gemma4-v1-2610 \
   --output results/rel-amazon/discovery/strands-decider-e4b-graph-oracle-root.jsonl
 
 # Reproducible random ranking baseline (no model weights are loaded).
 python scripts/discover_signals.py \
   --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --hop-limit 2 --scorer random --seed 42 \
+  --hop-limit 2 --method catalog-rank --model random --seed 42 \
   --output results/rel-amazon/discovery/random-seed42.jsonl
 
 ```
@@ -417,6 +440,46 @@ Each JSONL result retains the input condition, candidate-generation settings,
 full candidate count and the top-ranked candidates. Treat the returned scores
 as model outputs to evaluate against manual relevance judgements, not as ground
 truth relevance labels.
+
+### Generative-LLM discovery
+
+Generative-LLM model profiles score each condition/signal pair independently with a
+generative LLM. It returns a **0--100 utility score** and short evidence note;
+this is a discovery score, not the 0--3 LLM-judge relevance grade and not a
+probability. With `--method graph-search`, the same pointwise score evaluates
+each legal graph action, retains the top `--branch-width` actions by within-menu
+ordinal rank, then reranks only the discovered shortlist. The
+`graph-search-oracle-root` strategy is the target-entity-proxy diagnostic.
+
+The local models run through vLLM; GPT-6 Luna reuses the OCI/Wayflow setup used
+by the judge script. Pass `--model-cache-root` to keep Hugging Face weights out
+of `/home`, and `--resume` to persist completed conditions as they finish.
+
+```bash
+# Full-catalog schema reasoning with a local model.
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --method catalog-rank --model muse-glimmer-30b \
+  --hop-limit 2 --batch-size 4 --max-tokens 256 --max-attempts 2 \
+  --model-cache-root /storage/lcostes/model-cache/huggingface \
+  --resume --output results/rel-amazon/discovery/llm-muse-schema.jsonl
+
+# LLM-guided graph search and LLM shortlist reranking.
+python scripts/discover_signals.py \
+  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --dataset-root data/dev/rel-amazon \
+  --method graph-search --model muse-glimmer-30b \
+  --hop-limit 2 --max-decisions 12 --branch-width 2 --max-signals 10 \
+  --batch-size 4 --max-tokens 256 \
+  --model-cache-root /storage/lcostes/model-cache/huggingface \
+  --resume --output results/rel-amazon/discovery/llm-muse-graph.jsonl
+```
+
+Evaluate these runs against the human qrels in
+`notebooks/analyze_signal_discovery_results.ipynb`. LLM qrels are diagnostic
+views only, because using them as headline labels for an LLM discovery method
+would introduce evaluator/model bias.
 
 ## LLM-as-a-judge signal relevance evaluation
 

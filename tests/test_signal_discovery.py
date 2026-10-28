@@ -20,7 +20,15 @@ from src.schema.schema_graph import SchemaGraph  # noqa: E402
 from src.signals.candidates import candidate_from_dict, enumerate_signal_candidates  # noqa: E402
 from src.signals.graph_navigation import (  # noqa: E402
     DeciderGraphNavigator,
+    LLMGraphNavigator,
     format_search_history,
+)
+from src.signals.llm_discovery import (  # noqa: E402
+    LLMDiscoveryConfig,
+    LLMPointwiseSignalScorer,
+    build_action_prompt,
+    build_signal_prompt,
+    parse_utility_response,
 )
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
@@ -84,6 +92,38 @@ class _NavigationFakeDecider:
                 }
             )
         return answers
+
+
+class _FakePointwiseLLM:
+    """Offline action scorer that ranks the first legal option highest."""
+
+    model_name = "fake-pointwise-llm"
+
+    def score_actions(self, context, question, actions, action_kinds):
+        del context, question, action_kinds
+        return [
+            {"status": "scored", "utility_score": 100 - index, "evidence": f"action {index}", "attempts": 1}
+            for index, _ in enumerate(actions)
+        ]
+
+
+class _FakeSignalLLM(LLMPointwiseSignalScorer):
+    def _generate(self, messages):
+        # Deliberately ties every candidate to exercise deterministic ID ordering.
+        return ['{"utility_score": 50, "evidence": "schema evidence"}'] * len(messages)
+
+
+class _ZeroTiePointwiseLLM:
+    """Offline scorer that gives every legal action the same utility."""
+
+    model_name = "zero-tie-pointwise-llm"
+
+    def score_actions(self, context, question, actions, action_kinds):
+        del context, question, action_kinds
+        return [
+            {"status": "scored", "utility_score": 0, "evidence": "no progress", "attempts": 1}
+            for _ in actions
+        ]
 
 
 class SignalDiscoveryTest(unittest.TestCase):
@@ -164,6 +204,68 @@ tables:
         self.assertNotIn(
             "attribute:product:product>review:review.product_id", identifiers
         )
+
+    def test_pointwise_utility_parser_rejects_invalid_values(self):
+        self.assertEqual(
+            parse_utility_response('{"utility_score": 50, "evidence": "schema grounded"}')["status"],
+            "scored",
+        )
+        self.assertEqual(
+            parse_utility_response('{"utility_score": 101, "evidence": "bad"}')["status"],
+            "invalid_response",
+        )
+
+    def test_pointwise_utility_parser_recovers_valid_score_from_bad_evidence_quoting(self):
+        parsed = parse_utility_response(
+            '{"utility_score": 62, "evidence": "Product text is "useful" context"}'
+        )
+        self.assertEqual(parsed["status"], "scored")
+        self.assertEqual(parsed["utility_score"], 62)
+        self.assertEqual(parsed["parse_status"], "recovered_score")
+
+    def test_llm_graph_navigator_retains_ordinal_action_trace(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=1)
+        result = LLMGraphNavigator(
+            _FakePointwiseLLM(), max_hops=1, max_decisions=2, branch_width=1
+        ).discover("Find useful products", candidates, self.graph)
+        self.assertTrue(result.trace)
+        scored_actions = result.trace[0]["llm_pointwise_actions"]
+        self.assertEqual(scored_actions[0]["ordinal_rank"], 1)
+        self.assertEqual(result.trace[0]["frontier_selection"], "within_menu_ordinal_rank")
+
+    def test_llm_graph_ties_prefer_exploration_to_stopping(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=1)
+        result = LLMGraphNavigator(
+            _ZeroTiePointwiseLLM(), max_hops=1, max_decisions=1, branch_width=1
+        ).discover("Find useful products", candidates, self.graph)
+        root = result.trace[0]
+        self.assertTrue(root["model_choice"].startswith("Start from table:"))
+        self.assertTrue(all(action["kind"] == "start" for action in root["legal_actions"]))
+
+    def test_graph_action_prompts_explain_control_actions(self):
+        root = "\n".join(message["content"] for message in build_action_prompt(
+            "state", "question", "Start from table: product", "start"
+        ))
+        traverse = "\n".join(message["content"] for message in build_action_prompt(
+            "state", "question", "Traverse relationship: product to review", "traverse"
+        ))
+        select = "\n".join(message["content"] for message in build_action_prompt(
+            "state", "question", "Select attribute: product.price", "select_attribute"
+        ))
+        self.assertIn("root-selection action, not a signal", root)
+        self.assertIn("traversal action, not a signal", traverse)
+        self.assertIn("ordinary usefulness", select)
+
+    def test_llm_pointwise_scorer_is_tie_stable_and_prompt_has_no_grades(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=0)
+        scorer = _FakeSignalLLM(LLMDiscoveryConfig(
+            model_family="mistral", model_name="fake", batch_size=4
+        ))
+        ranked = scorer.score("Find products", candidates, self.graph)
+        self.assertEqual([item.candidate.id for item in ranked], sorted(candidate.id for candidate in candidates))
+        self.assertTrue(all(item.metadata and item.metadata["utility_score"] == 50 for item in ranked))
+        prompt = build_signal_prompt("Find products", candidates[0], self.graph, "Schema: x")
+        self.assertNotIn("Relevance grades", "\n".join(message["content"] for message in prompt))
 
     def test_human_signal_explanation_and_diagram_preserve_the_path(self):
         candidate = next(
@@ -335,6 +437,10 @@ tables:
         )
         self.assertEqual(result.trace[0]["current_path"], None)
         self.assertEqual(result.trace[0]["model_choice"], "Start from table: product")
+        self.assertNotIn(
+            "Finish discovery without selecting a start table.",
+            [action["option"] for action in result.trace[0]["legal_actions"]],
+        )
         self.assertEqual(result.trace[1]["current_path"], ["product"])
         self.assertIn("Current path: product", result.trace[1]["state_context"])
         self.assertIn(
@@ -350,6 +456,45 @@ tables:
             path = decision["current_path"]
             assert path is not None
             self.assertEqual(len(path), len(set(path)))
+
+    def test_graph_search_cannot_finish_before_selecting_a_signal(self):
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=2)
+        result = DeciderGraphNavigator(
+            client=_NavigationFakeDecider(),
+            max_hops=2,
+            max_decisions=2,
+            branch_width=1,
+            max_signals=2,
+        ).discover("Find products with strong ratings", candidates, self.graph)
+        for event in result.trace:
+            if not event["current_path"]:
+                continue
+            self.assertNotIn(
+                "Finish discovery and return the signals collected so far.",
+                [action["option"] for action in event["legal_actions"]],
+            )
+
+    def test_graph_search_closes_a_one_option_leaf_without_calling_the_model(self):
+        from src.signals.graph_navigation import _Action
+
+        class _LeafNavigator(DeciderGraphNavigator):
+            def _legal_actions(self, state, catalog, graph, discovered):
+                del state, catalog, graph, discovered
+                return (_Action("stop_branch", "Stop this path; continue any other queued paths."),)
+
+        candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=0)
+        result = _LeafNavigator(
+            client=_NavigationFakeDecider(),
+            max_hops=0,
+            max_decisions=3,
+            branch_width=1,
+            max_signals=2,
+        ).discover("Find products", candidates, self.graph)
+        # One root-table decision is made; the leaf has only stop_branch and
+        # is closed by the program rather than sent to a two-choice Decider.
+        self.assertEqual(result.model_calls, 1)
+        self.assertEqual(len(result.trace), 1)
+        self.assertEqual(result.signals, ())
 
     def test_model_selected_root_branches_to_top_tables(self):
         candidates = enumerate_signal_candidates(self.dataset, self.graph, max_hops=2)

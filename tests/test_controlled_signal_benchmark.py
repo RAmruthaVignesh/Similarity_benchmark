@@ -72,7 +72,7 @@ class ControlledSignalBenchmarkTest(unittest.TestCase):
         )
 
         row = _score_task(
-            "decider-graph-reranked", task, [ScoredSignal(candidate, 1.0)], graph=None,
+            "strands-decider", task, [ScoredSignal(candidate, 1.0)], graph=None,
             candidate_count=39,
         )
 

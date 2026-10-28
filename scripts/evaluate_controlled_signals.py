@@ -8,9 +8,9 @@ import gc
 import hashlib
 import json
 import math
+import os
 import random
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -22,14 +22,20 @@ from src.schema.schema_graph import SchemaGraph  # noqa: E402
 from src.signals.candidates import SignalCandidate, enumerate_signal_candidates  # noqa: E402
 from src.signals.graph_navigation import (  # noqa: E402
     DeciderGraphNavigator,
+    LLMGraphNavigator,
     format_explored_schema_view,
+)
+from src.signals.llm_discovery import LLMDiscoveryConfig, LLMPointwiseSignalScorer  # noqa: E402
+from src.signals.model_registry import (  # noqa: E402
+    DISCOVERY_METHODS,
+    DISCOVERY_MODEL_PROFILES,
+    resolve_discovery_model,
 )
 from src.signals.scorers import (  # noqa: E402
     DeciderSignalScorer,
     MiniLMCrossEncoderScorer,
     ScoredSignal,
     create_choice_decider_client,
-    default_decider_model,
 )
 from src.synthetic.controlled_signal_benchmark_v2 import (  # noqa: E402
     BENCHMARK_VERSION,
@@ -51,25 +57,31 @@ def main() -> int:
     parser.add_argument("--benchmark-root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument(
         "--method",
-        choices=(
-            "rank",
-            "decider-graph-reranked",
-            "decider-graph-reranked-oracle-root",
-        ),
-        default="rank",
+        choices=DISCOVERY_METHODS,
+        required=True,
         help=(
-            "rank the full candidate set, or graph-search and rerank its shortlist; "
+            "score the full candidate catalog, or graph-search and rerank its shortlist; "
             "the oracle-root ablation uses each controlled task's known source table"
         ),
     )
     parser.add_argument(
-        "--scorer",
-        action="append",
-        choices=("minilm", "strands-decider", "random"),
+        "--model",
+        choices=tuple(DISCOVERY_MODEL_PROFILES),
         required=True,
-        help="repeat to compare several methods",
+        help="validated model profile used to execute the method",
     )
-    parser.add_argument("--model-name", help="optional model ID; valid with one non-random scorer")
+    parser.add_argument("--model-revision", default="main")
+    parser.add_argument("--model-cache-root", type=Path, help="shared Hugging Face cache root")
+    parser.add_argument("--max-tokens", type=int, default=256, help="LLM JSON generation cap")
+    parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument("--tensor-parallel-size", type=int)
+    parser.add_argument("--gpu-memory-utilization", type=float)
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--max-num-seqs", type=int)
+    parser.add_argument("--oci-compartment-id", default=os.environ.get("OCI_GENAI_COMPARTMENT"))
+    parser.add_argument("--oci-config", type=Path, default=Path("~/.oci/config"))
+    parser.add_argument("--oci-profile", default="DEFAULT")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0, help="random-baseline seed")
@@ -80,27 +92,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
-    scorer_names = tuple(dict.fromkeys(args.scorer))
-    is_graph = args.method in {
-        "decider-graph-reranked",
-        "decider-graph-reranked-oracle-root",
-    }
-    oracle_root = args.method == "decider-graph-reranked-oracle-root"
-    typed_deciders = {"strands-decider"}
-    if is_graph and (len(scorer_names) != 1 or scorer_names[0] not in typed_deciders):
-        parser.error(
-            "Decider graph methods require exactly one --scorer strands-decider"
-        )
-    if is_graph and args.model_name is None:
-        args.model_name = default_decider_model("strands")
+    profile = resolve_discovery_model(args.model)
+    is_graph = args.method in {"graph-search", "graph-search-oracle-root"}
+    oracle_root = args.method == "graph-search-oracle-root"
+    is_llm = profile.runner == "llm"
+    if args.method not in profile.supported_methods:
+        parser.error(f"--model {profile.name} does not support --method {args.method}")
     if oracle_root and args.max_decisions < 2:
         parser.error("oracle-root evaluation requires --max-decisions of at least 2")
-    if args.model_name and len(scorer_names) != 1:
-        parser.error("--model-name requires exactly one scorer")
-    if args.model_name and scorer_names[0] == "random":
-        parser.error("--model-name cannot be used with random")
 
     try:
+        if is_llm and args.model_cache_root:
+            _configure_model_cache(args.model_cache_root)
         dataset = LocalRelBenchDataset(args.benchmark_root)
         graph = SchemaGraph.from_manifest(dataset.schema)
         tasks = load_tasks(args.benchmark_root)
@@ -124,20 +127,27 @@ def main() -> int:
                 "rebuild the controlled benchmark"
             )
         rows = []
-        for scorer_name in scorer_names:
-            if is_graph:
-                backend = _decider_backend(scorer_name)
+        if is_graph:
+            if is_llm:
+                scorer = LLMPointwiseSignalScorer(_llm_config(args, profile))
+                navigator = LLMGraphNavigator(
+                    scorer,
+                    max_hops=MAX_HOPS,
+                    max_decisions=args.max_decisions,
+                    branch_width=args.branch_width,
+                    max_signals=args.max_signals,
+                )
+            else:
+                backend = _decider_backend(profile.runner)
+                assert profile.model_id is not None
                 shared_decider = create_choice_decider_client(
-                    backend, args.model_name, device=args.device
+                    backend, profile.model_id, device=args.device
                 )
                 scorer = DeciderSignalScorer(
-                    args.model_name,
-                    backend=backend,
-                    device=args.device,
-                    client=shared_decider,
+                    profile.model_id, backend=backend, device=args.device, client=shared_decider
                 )
                 navigator = DeciderGraphNavigator(
-                    model_name=args.model_name,
+                    model_name=profile.model_id,
                     backend=backend,
                     device=args.device,
                     max_hops=MAX_HOPS,
@@ -146,49 +156,58 @@ def main() -> int:
                     max_signals=args.max_signals,
                     client=shared_decider,
                 )
-                output_name = args.method
+        else:
+            scorer = _build_scorer(profile, args)
+            navigator = None
+        for task in tasks:
+            _validate_task(task, candidates)
+            if navigator is None:
+                ranked = _rank(profile.runner, scorer, task, candidates, graph, args.seed)
             else:
-                scorer = _build_scorer(scorer_name, args)
-                navigator = None
-                output_name = scorer_name
-            for task in tasks:
-                _validate_task(task, candidates)
-                if navigator is None:
-                    ranked = _rank(scorer_name, scorer, task, candidates, graph, args.seed)
-                else:
-                    search_result = navigator.discover(
-                        task.condition,
-                        candidates,
-                        graph,
-                        start_table=task.source_table if oracle_root else None,
-                    )
-                    explored_schema_context = format_explored_schema_view(
-                        search_result,
-                        graph,
-                        forced_root=task.source_table if oracle_root else None,
-                    )
-                    ranked = scorer.score(
-                        task.condition,
-                        search_result.signals,
-                        graph,
-                        explored_schema_context=explored_schema_context,
-                    )
-                score_row = _score_task(
-                    output_name, task, ranked, graph, len(candidates), candidates
+                search_result = navigator.discover(
+                    task.condition,
+                    candidates,
+                    graph,
+                    start_table=task.source_table if oracle_root else None,
                 )
-                if is_graph:
-                    score_row["root_mode"] = "oracle" if oracle_root else "model_selected"
-                    score_row["ranking_stage"] = (
-                        "Decider ranking from explored schema view over discovered shortlist"
-                    )
-                    score_row["root_selection"] = _root_selection_record(
-                        search_result, task, oracle_root=oracle_root
-                    )
-                rows.append(score_row)
-            scorer = None
-            _release_scorer()
+                explored_schema_context = format_explored_schema_view(
+                    search_result,
+                    graph,
+                    forced_root=task.source_table if oracle_root else None,
+                )
+                ranked = scorer.score(
+                    task.condition,
+                    search_result.signals,
+                    graph,
+                    explored_schema_context=explored_schema_context,
+                )
+            score_row = _score_task(
+                profile.name, task, ranked, graph, len(candidates), candidates
+            )
+            score_row.update({
+                "method": args.method,
+                "model": profile.name,
+                "model_id": getattr(scorer, "model_name", profile.model_id),
+                "runner": profile.runner,
+            })
+            if is_graph:
+                score_row["root_mode"] = "oracle" if oracle_root else "model_selected"
+                score_row["ranking_stage"] = (
+                    "LLM pointwise reranking from explored schema view over discovered shortlist"
+                    if is_llm else "Decider ranking from explored schema view over discovered shortlist"
+                )
+                score_row["root_selection"] = _root_selection_record(
+                    search_result, task, oracle_root=oracle_root
+                )
+            rows.append(score_row)
+        scorer = None
+        _release_scorer()
         summary = _summarize(rows)
+        summary["result_format"] = "controlled-signal-discovery-v3"
         summary["method"] = args.method
+        summary["model"] = profile.name
+        summary["model_id"] = profile.model_id
+        summary["runner"] = profile.runner
         summary["candidate_count"] = len(candidates)
         summary["candidate_id_sha256"] = candidate_fingerprint
         summary["max_hops"] = MAX_HOPS
@@ -230,9 +249,9 @@ def main() -> int:
         parser.exit(2, f"error: {error}\n")
 
     _write_results(summary, rows, args.output)
-    for scorer_name, scores in summary["scorers"].items():
+    for model_name, scores in summary["models"].items():
         print(
-            f"{scorer_name}: nDCG@3={scores['ndcg@3']:.3f} "
+            f"{model_name}: nDCG@3={scores['ndcg@3']:.3f} "
             f"Recall@3={scores['recall@3']:.3f} MRR={scores['mrr']:.3f} "
             f"({scores['task_count']} tasks)"
         )
@@ -248,39 +267,71 @@ def main() -> int:
     return 0
 
 
-def _build_scorer(name: str, args: argparse.Namespace) -> Any | None:
-    if name == "random":
+def _build_scorer(profile: Any, args: argparse.Namespace) -> Any | None:
+    if profile.runner == "random":
         return None
-    if name == "minilm":
+    if profile.runner == "minilm":
+        assert profile.model_id is not None
         return MiniLMCrossEncoderScorer(
-            args.model_name or "cross-encoder/ms-marco-MiniLM-L-6-v2",
+            profile.model_id,
             device=args.device,
             batch_size=args.batch_size,
         )
-    if name == "strands-decider":
+    if profile.runner == "strands-decider":
+        assert profile.model_id is not None
         return DeciderSignalScorer(
-            args.model_name or default_decider_model("strands"),
+            profile.model_id,
             backend="strands",
             device=args.device,
         )
-    raise ValueError(f"unsupported scorer: {name}")
+    if profile.runner == "llm":
+        return LLMPointwiseSignalScorer(_llm_config(args, profile))
+    raise ValueError(f"unsupported model runner: {profile.runner}")
 
 
-def _decider_backend(scorer_name: str) -> str:
-    if scorer_name == "strands-decider":
+def _decider_backend(runner: str) -> str:
+    if runner == "strands-decider":
         return "strands"
-    raise ValueError(f"{scorer_name!r} is not a typed-choice Decider scorer")
+    raise ValueError(f"{runner!r} is not a typed-choice Decider runner")
+
+
+def _llm_config(args: argparse.Namespace, profile: Any) -> LLMDiscoveryConfig:
+    assert profile.llm_family is not None
+    assert profile.model_id is not None
+    return LLMDiscoveryConfig(
+        model_family=profile.llm_family,
+        model_name=profile.model_id,
+        model_revision=args.model_revision,
+        seed=args.seed,
+        max_tokens=args.max_tokens,
+        reasoning_effort=args.reasoning_effort,
+        batch_size=args.batch_size,
+        max_attempts=args.max_attempts,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
+        oci_compartment_id=args.oci_compartment_id,
+        oci_config=str(args.oci_config.expanduser()),
+        oci_profile=args.oci_profile,
+    )
+
+
+def _configure_model_cache(cache_root: Path) -> None:
+    cache_root = cache_root.expanduser().resolve()
+    os.environ["HF_HOME"] = str(cache_root)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_root / "hub")
 
 
 def _rank(
-    name: str,
+    runner: str,
     scorer: Any | None,
     task: ControlledSignalTask,
     candidates: Sequence[SignalCandidate],
     graph: SchemaGraph,
     seed: int,
 ) -> Sequence[ScoredSignal]:
-    if name != "random":
+    if runner != "random":
         assert scorer is not None
         return scorer.score(task.condition, candidates, graph)
     rng = random.Random(_stable_seed(seed, task.id))
@@ -317,7 +368,7 @@ def _validate_task(task: ControlledSignalTask, candidates: Sequence[SignalCandid
 
 
 def _score_task(
-    scorer_name: str,
+    model_name: str,
     task: ControlledSignalTask,
     ranked: Sequence[ScoredSignal],
     graph: SchemaGraph,
@@ -326,7 +377,8 @@ def _score_task(
 ) -> dict[str, object]:
     grades = [task.signal_grades[item.candidate.id] for item in ranked]
     row: dict[str, object] = {
-        "scorer": scorer_name,
+        "result_format": "controlled-signal-discovery-v3",
+        "model": model_name,
         "task_id": task.id,
         "condition": task.condition,
         "source_table": task.source_table,
@@ -441,9 +493,9 @@ def _mrr_primary(grades: Sequence[int]) -> float:
 
 
 def _summarize(rows: Sequence[dict[str, object]]) -> dict[str, object]:
-    by_scorer: dict[str, list[dict[str, object]]] = defaultdict(list)
+    by_model: dict[str, list[dict[str, object]]] = {}
     for row in rows:
-        by_scorer[str(row["scorer"])].append(row)
+        by_model.setdefault(str(row["model"]), []).append(row)
     metric_names = (
         "ndcg@1", "ndcg@3", "ndcg@5", "recall@1", "recall@3", "recall@5", "mrr",
         "path_exact_ndcg@1", "path_exact_ndcg@3", "path_exact_ndcg@5",
@@ -455,16 +507,16 @@ def _summarize(rows: Sequence[dict[str, object]]) -> dict[str, object]:
     )
     return {
         "benchmark": BENCHMARK_VERSION,
-        "scorers": {
+        "models": {
             name: {
-                "task_count": len(scorer_rows),
+                "task_count": len(model_rows),
                 **{
-                    metric: sum(float(row[metric]) for row in scorer_rows) / len(scorer_rows)
+                    metric: sum(float(row[metric]) for row in model_rows) / len(model_rows)
                     for metric in metric_names
-                    if all(metric in row for row in scorer_rows)
+                    if all(metric in row for row in model_rows)
                 },
             }
-            for name, scorer_rows in by_scorer.items()
+            for name, model_rows in by_model.items()
         },
     }
 

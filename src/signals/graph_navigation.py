@@ -20,10 +20,12 @@ from typing import Any, Mapping, Sequence
 
 from src.schema.schema_graph import Edge, SchemaGraph
 from src.signals.candidates import SignalCandidate
+from src.signals.llm_discovery import LLMPointwiseSignalScorer
 from src.signals.scorers import create_choice_decider_client, default_decider_model
 
 __all__ = [
     "DeciderGraphNavigator",
+    "LLMGraphNavigator",
     "GraphDiscoveryResult",
     "format_explored_schema_view",
     "format_search_history",
@@ -175,10 +177,13 @@ class DeciderGraphNavigator:
             heapq.heappush(frontier, (-state.log_probability, state.branch_id, state))
             next_branch_id = 1
         else:
+            # A root table is required.  A stop action here lets a pointwise
+            # scorer treat every start action as "not yet a signal" and end the
+            # search before it has inspected anything.
             root_actions = tuple(
                 _Action("start", f"Start from table: {table.name}", target_table=table.name)
                 for table in graph.get_tables()
-            ) + (_Action("stop_search", "Finish discovery without selecting a start table."),)
+            )
             root_context = _format_navigation_context(
                 intent,
                 graph,
@@ -192,7 +197,7 @@ class DeciderGraphNavigator:
             root_answer, root_probabilities = self._decide(
                 client,
                 root_context,
-                "Which table is the best starting point for discovering useful schema signals?",
+                "Which table is the most promising starting point for discovering useful schema signals?",
                 root_actions,
             )
             model_calls += 1
@@ -233,8 +238,6 @@ class DeciderGraphNavigator:
                 heapq.heappush(frontier, (-state.log_probability, state.branch_id, state))
 
         expanded_states: set[tuple[tuple[str, ...], frozenset[str]]] = set()
-        if start_table is None and root_answer == "Finish discovery without selecting a start table.":
-            return GraphDiscoveryResult((), tuple(trace), model_calls, "model_stopped_search")
         while frontier and model_calls < decision_budget and len(discovered) < self.max_signals:
             _, _, state = heapq.heappop(frontier)
             signature = (state.path, state.selected_signal_ids)
@@ -243,6 +246,13 @@ class DeciderGraphNavigator:
             expanded_states.add(signature)
 
             actions = self._legal_actions(state, catalog, graph, discovered)
+            # At a leaf with no unselected signal, the only legal operation is
+            # to close this branch.  This is a program decision, not a
+            # meaningful one-option model choice; Decider also requires at
+            # least two alternatives per call.
+            if len(actions) == 1:
+                assert actions[0].kind == "stop_branch"
+                continue
             context = _format_navigation_context(
                 intent,
                 graph,
@@ -368,18 +378,22 @@ class DeciderGraphNavigator:
                             edge=edge,
                         )
                     )
-        actions.extend(
-            (
-                _Action(
-                    "stop_branch",
-                    "Stop this path; continue any other queued paths.",
-                ),
+        actions.append(
+            _Action(
+                "stop_branch",
+                "Stop this path; continue any other queued paths.",
+            )
+        )
+        # Finishing the whole search is meaningful only after at least one
+        # signal has been collected.  Until then the program requires further
+        # exploration rather than allowing an empty output.
+        if discovered:
+            actions.append(
                 _Action(
                     "stop_search",
                     "Finish discovery and return the signals collected so far.",
-                ),
+                )
             )
-        )
         _require_unique_options(actions)
         return tuple(actions)
 
@@ -413,6 +427,95 @@ class DeciderGraphNavigator:
                 self.backend, self.model_name, device=self.device
             )
         return self._client
+
+
+class LLMGraphNavigator(DeciderGraphNavigator):
+    """Graph search whose legal actions are scored independently by an LLM.
+
+    The parent class remains the sole owner of legal-action generation and graph
+    state.  Pointwise utility scores are converted to within-menu ordinal
+    weights only for frontier scheduling; they are never presented as model
+    probabilities.
+    """
+
+    def __init__(self, scorer: LLMPointwiseSignalScorer, **kwargs: Any) -> None:
+        super().__init__(model_name=scorer.model_name, client=None, **kwargs)
+        self._llm_scorer = scorer
+        self._llm_decisions: list[dict[str, object]] = []
+
+    def discover(
+        self,
+        intent: str,
+        candidates: Sequence[SignalCandidate],
+        graph: SchemaGraph,
+        *,
+        start_table: str | None = None,
+    ) -> GraphDiscoveryResult:
+        self._llm_decisions = []
+        result = super().discover(intent, candidates, graph, start_table=start_table)
+        if len(result.trace) != len(self._llm_decisions):  # pragma: no cover - defensive
+            raise RuntimeError("LLM graph trace is inconsistent with graph decisions")
+        trace = []
+        for event, decision in zip(result.trace, self._llm_decisions, strict=True):
+            enriched = dict(event)
+            enriched["llm_pointwise_actions"] = decision["actions"]
+            enriched["frontier_selection"] = "within_menu_ordinal_rank"
+            trace.append(enriched)
+        return GraphDiscoveryResult(result.signals, tuple(trace), result.model_calls, result.stop_reason)
+
+    def _get_client(self) -> None:
+        # ``_decide`` ignores the typed-choice client argument inherited from
+        # DeciderGraphNavigator, but the parent search loop retains one common
+        # control flow for both navigation methods.
+        return None
+
+    def _decide(
+        self,
+        client: Any,
+        context: str,
+        question: str,
+        actions: Sequence[_Action],
+    ) -> tuple[str | None, dict[str, float]]:
+        del client
+        if len(actions) < 2:
+            raise ValueError("LLM graph navigation requires at least two legal actions")
+        judgments = self._llm_scorer.score_actions(
+            context,
+            question,
+            [action.option for action in actions],
+            [action.kind for action in actions],
+        )
+        ordered = sorted(
+            enumerate(judgments),
+            key=lambda item: (
+                -int(item[1]["utility_score"]),
+                _stop_tie_priority(actions[item[0]]),
+                actions[item[0]].option,
+            ),
+        )
+        ranks = {index: rank for rank, (index, _) in enumerate(ordered, start=1)}
+        # Reciprocal ranks fit the parent's 0..1 frontier API without being
+        # normalized across a menu. Thus rank 1 always has weight 1, rank 2
+        # has weight 1/2, etc.; menu size cannot change cross-branch priority.
+        probabilities = {
+            actions[index].option: 1.0 / ranks[index]
+            for index in range(len(actions))
+        }
+        self._llm_decisions.append({
+            "actions": [
+                {
+                    "option": action.option,
+                    "utility_score": int(judgment["utility_score"]),
+                    "evidence": str(judgment["evidence"]),
+                    "attempts": int(judgment["attempts"]),
+                    "parse_status": str(judgment.get("parse_status", "unknown")),
+                    "parse_error": judgment.get("parse_error"),
+                    "ordinal_rank": ranks[index],
+                }
+                for index, (action, judgment) in enumerate(zip(actions, judgments, strict=True))
+            ]
+        })
+        return actions[ordered[0][0]].option, probabilities
 
 
 def format_search_history(
@@ -644,7 +747,7 @@ def _top_actions(
 ) -> tuple[tuple[_Action, float], ...]:
     ranked = sorted(
         ((action, max(0.0, probabilities.get(action.option, 0.0)), index) for index, action in enumerate(actions)),
-        key=lambda row: (-row[1], row[2]),
+        key=lambda row: (-row[1], _stop_tie_priority(row[0]), row[2]),
     )
     if chosen_option is None:
         return tuple((action, probability) for action, probability, _ in ranked[:count])
@@ -656,6 +759,11 @@ def _top_actions(
         if action.option != chosen_option
     ]
     return tuple([(chosen, chosen_probability), *remainder[: count - 1]])
+
+
+def _stop_tie_priority(action: _Action) -> int:
+    """Prefer exploration or signal selection over stopping when tied."""
+    return 1 if action.kind in {"stop_branch", "stop_search"} else 0
 
 
 def _trace_entry(
@@ -704,6 +812,8 @@ def _format_navigation_context(
         "it does not bundle attributes from reached tables. Select a separate "
         "attribute action when that attribute is the intended evidence.",
         "The program validates and executes your choice before the next decision.",
+        "A starting table must be selected before discovery can finish. The whole "
+        "search can finish only after at least one signal has been selected.",
         "",
         f"User intent: {intent}",
         "",

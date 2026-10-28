@@ -53,6 +53,7 @@ class ScoredSignal:
     candidate: SignalCandidate
     score: float
     ranking_logit: float | None = None
+    metadata: Mapping[str, object] | None = None
 
     def to_dict(self, graph: SchemaGraph) -> dict[str, object]:
         return {
@@ -63,6 +64,7 @@ class ScoredSignal:
                 if self.ranking_logit is not None
                 else {}
             ),
+            **(dict(self.metadata) if self.metadata is not None else {}),
         }
 
 
