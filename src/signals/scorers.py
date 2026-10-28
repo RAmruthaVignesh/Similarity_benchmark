@@ -67,6 +67,22 @@ class ScoredSignal:
             **(dict(self.metadata) if self.metadata is not None else {}),
         }
 
+    def to_result_dict(self) -> dict[str, object]:
+        """Compact scored representation for discovery result artifacts."""
+        metadata = dict(self.metadata) if self.metadata is not None else {}
+        record = self.candidate.to_result_dict()
+        utility_score = metadata.get("utility_score")
+        if isinstance(utility_score, int) and not isinstance(utility_score, bool):
+            record["utility_score"] = utility_score
+            evidence = metadata.get("evidence")
+            if isinstance(evidence, str) and evidence:
+                record["evidence"] = evidence
+        else:
+            record["score"] = self.score
+            if self.ranking_logit is not None:
+                record["ranking_logit"] = self.ranking_logit
+        return record
+
 
 class RandomSignalScorer:
     """Stable random ordering for a reproducible ranking baseline."""

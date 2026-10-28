@@ -259,8 +259,7 @@ def main() -> int:
                 continue
             score_type = None
             if args.list_only:
-                signals = [candidate.to_dict(graph) for candidate in candidates]
-                probability_distribution = None
+                signals = [candidate.to_result_dict() for candidate in candidates]
                 graph_search = None
             elif navigator is not None:
                 oracle_root = oracle_roots.get(condition["id"])
@@ -281,26 +280,17 @@ def main() -> int:
                         explored_schema_context=explored_schema_context,
                     )
                     signals = _scored_signal_dicts(reranked, graph)
-                    probability_distribution = (
-                        {scored.candidate.id: scored.score for scored in reranked}
-                        if not is_llm else None
-                    )
                     score_type = (
                         "llm_pointwise_utility_0_100_within_discovered_shortlist"
                         if is_llm else "choice_probability_within_discovered_shortlist"
                     )
                 else:
-                    signals = [candidate.to_dict(graph) for candidate in result.signals]
-                    probability_distribution = None
+                    signals = [candidate.to_result_dict() for candidate in result.signals]
                     score_type = "no_rerank_singleton_or_empty_shortlist"
                 graph_search = result.to_dict(graph)["search"]
             else:
                 scored_signals = scorer.score(condition["condition"], candidates, graph)
                 signals = _scored_signal_dicts(scored_signals, graph)
-                probability_distribution = (
-                    {scored.candidate.id: scored.score for scored in scored_signals}
-                    if profile.runner == "strands-decider" else None
-                )
                 score_type = (
                     "llm_pointwise_utility_0_100" if is_llm else
                     "choice_probability" if profile.runner == "strands-decider" else
@@ -308,17 +298,15 @@ def main() -> int:
                 )
                 graph_search = None
             records.append({
-                "result_format": "signal-discovery-v3",
+                "result_format": "signal-discovery-v4",
                 "condition_id": condition["id"], "condition": condition["condition"],
                 "method": "catalog-rank" if args.list_only else args.method,
                 "model": "schema-only" if args.list_only else profile.name,
-                "model_id": model_name, "runner": "schema-only" if args.list_only else profile.runner,
+                "model_id": model_name,
                 "signal_catalog": args.catalog_view,
-                "catalog_definition": "path-specific attributes and relationship paths" if args.catalog_view == "path-aware" else "one direct candidate per physical attribute; no relationship/path candidates",
                 "hop_limit": args.hop_limit,
-                "source_tables": list(args.source_tables or dataset.get_tables()),
-                "candidate_count": len(candidates), "score_type": score_type,
-                "choice_probabilities": probability_distribution, "signals": signals,
+                "score_type": score_type,
+                "signals": signals,
                 **({"oracle_root_table": oracle_roots[condition["id"]]} if is_oracle_root else {}),
                 **({"random_seed": args.seed} if profile.runner == "random" else {}),
                 **({"llm_config": _llm_provenance(scorer.config)} if is_llm else {}),
@@ -512,7 +500,6 @@ def _llm_provenance(config: LLMDiscoveryConfig) -> dict[str, object]:
         "max_tokens": config.max_tokens,
         "reasoning_effort": config.reasoning_effort,
         "max_attempts": config.max_attempts,
-        "score_scale": "utility_0_100",
         "evaluation_note": "Discovery does not use human or LLM relevance labels.",
     }
 
@@ -521,7 +508,7 @@ def _scored_signal_dicts(scored_signals: Iterable[Any], graph: SchemaGraph) -> l
     """Serialize ordered scorer output with an explicit, stable one-based rank."""
     records = []
     for rank, scored in enumerate(scored_signals, start=1):
-        record = dict(scored.to_dict(graph))
+        record = dict(scored.to_result_dict())
         record["rank"] = rank
         records.append(record)
     return records

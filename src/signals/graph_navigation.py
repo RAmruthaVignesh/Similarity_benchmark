@@ -50,7 +50,7 @@ class _Action:
         }
         if self.candidate is not None:
             record["candidate_id"] = self.candidate.id
-            record["candidate"] = self.candidate.to_dict(graph)
+            record["candidate"] = self.candidate.to_result_dict()
         if self.target_table is not None:
             record["target_table"] = self.target_table
         if self.edge is not None:
@@ -82,7 +82,7 @@ class GraphDiscoveryResult:
 
     def to_dict(self, graph: SchemaGraph) -> dict[str, object]:
         return {
-            "signals": [candidate.to_dict(graph) for candidate in self.signals],
+            "signals": [candidate.to_result_dict() for candidate in self.signals],
             "search": {
                 "model_calls": self.model_calls,
                 "stop_reason": self.stop_reason,
@@ -507,9 +507,6 @@ class LLMGraphNavigator(DeciderGraphNavigator):
                     "option": action.option,
                     "utility_score": int(judgment["utility_score"]),
                     "evidence": str(judgment["evidence"]),
-                    "attempts": int(judgment["attempts"]),
-                    "parse_status": str(judgment.get("parse_status", "unknown")),
-                    "parse_error": judgment.get("parse_error"),
                     "ordinal_rank": ranks[index],
                 }
                 for index, (action, judgment) in enumerate(zip(actions, judgments, strict=True))
