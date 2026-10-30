@@ -83,6 +83,12 @@ def main() -> int:
     parser.add_argument("--model-revision", default="main")
     parser.add_argument("--model-cache-root", type=Path, help="shared Hugging Face cache root")
     parser.add_argument("--max-tokens", type=int, default=256, help="LLM JSON generation cap")
+    parser.add_argument(
+        "--utility-scale",
+        choices=("0-10", "0-100"),
+        default="0-10",
+        help="LLM pointwise utility scale (default: 0-10)",
+    )
     parser.add_argument("--max-attempts", type=int, default=2, help="retry malformed LLM JSON this many times")
     parser.add_argument("--reasoning-effort", default="none")
     parser.add_argument("--tensor-parallel-size", type=int)
@@ -281,7 +287,7 @@ def main() -> int:
                     )
                     signals = _scored_signal_dicts(reranked, graph)
                     score_type = (
-                        "llm_pointwise_utility_0_100_within_discovered_shortlist"
+                        f"llm_pointwise_utility_0_{scorer.config.utility_score_max}_within_discovered_shortlist"
                         if is_llm else "choice_probability_within_discovered_shortlist"
                     )
                 else:
@@ -292,7 +298,7 @@ def main() -> int:
                 scored_signals = scorer.score(condition["condition"], candidates, graph)
                 signals = _scored_signal_dicts(scored_signals, graph)
                 score_type = (
-                    "llm_pointwise_utility_0_100" if is_llm else
+                    f"llm_pointwise_utility_0_{scorer.config.utility_score_max}" if is_llm else
                     "choice_probability" if profile.runner == "strands-decider" else
                     "random_score" if profile.runner == "random" else "cross_encoder_score"
                 )
@@ -307,6 +313,7 @@ def main() -> int:
                 "hop_limit": args.hop_limit,
                 "score_type": score_type,
                 "signals": signals,
+                **({"token_usage": _token_usage_summary(signals)} if is_llm else {}),
                 **({"oracle_root_table": oracle_roots[condition["id"]]} if is_oracle_root else {}),
                 **({"random_seed": args.seed} if profile.runner == "random" else {}),
                 **({"llm_config": _llm_provenance(scorer.config)} if is_llm else {}),
@@ -449,6 +456,7 @@ def _llm_config(args: argparse.Namespace, profile: Any) -> LLMDiscoveryConfig:
         model_revision=args.model_revision,
         seed=args.seed,
         max_tokens=args.max_tokens,
+        utility_score_max=int(args.utility_scale.removeprefix("0-")),
         reasoning_effort=args.reasoning_effort,
         batch_size=args.batch_size,
         max_attempts=args.max_attempts,
@@ -512,6 +520,47 @@ def _scored_signal_dicts(scored_signals: Iterable[Any], graph: SchemaGraph) -> l
         record["rank"] = rank
         records.append(record)
     return records
+
+
+def _token_usage_summary(signals: list[dict[str, object]]) -> dict[str, object] | None:
+    """Summarize per-signal LLM usage for one condition result."""
+    usages = [signal.get("token_usage") for signal in signals]
+    usages = [usage for usage in usages if isinstance(usage, dict)]
+    if not usages:
+        return None
+
+    def total(field: str) -> int | None:
+        values = [usage.get(field) for usage in usages]
+        if len(usages) != len(signals) or not all(isinstance(value, int) for value in values):
+            return None
+        return sum(values)
+
+    requests = sum(int(usage.get("requests", 1)) for usage in usages)
+    reported_reasoning = sum(
+        int(usage.get("reasoning_token_responses_reported", 0)) for usage in usages
+    )
+    reasoning_available = (
+        len(usages) == len(signals)
+        and all(bool(usage.get("reasoning_tokens_available")) for usage in usages)
+    )
+    return {
+        "input_tokens": total("input_tokens"),
+        "output_tokens": total("output_tokens"),
+        "total_tokens": total("total_tokens"),
+        "reasoning_tokens": (
+            sum(int(usage["reasoning_tokens"]) for usage in usages)
+            if reasoning_available else None
+        ),
+        "reasoning_tokens_available": reasoning_available,
+        "reasoning_token_responses_reported": reported_reasoning,
+        "responses": requests,
+        "signals_scored": len(signals),
+        "signals_with_token_usage": len(usages),
+        "exact_count": (
+            len(usages) == len(signals)
+            and all(bool(usage.get("exact_count")) for usage in usages)
+        ),
+    }
 
 
 def _configure_model_cache(root: Path) -> None:

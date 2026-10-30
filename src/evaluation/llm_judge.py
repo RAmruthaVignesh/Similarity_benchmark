@@ -148,13 +148,16 @@ SUPPORTED_MODELS = {
     "gemma-4-31b": "google/gemma-4-31B-it",
     "gpt-oss-120b": "openai/gpt-oss-120b",
     "gpt-6-luna": "openai.gpt-6-luna",
+    "gpt-6-sol": "openai.gpt-6-sol",
+    "gpt-5.6-terra": "openai.gpt-5.6-terra",
+    "gpt-6-astra": "openai.gpt-6-astra",
 }
 
 # These names refer to model-serving backends rather than model capability.
 # Keeping this explicit prevents an OCI model from accidentally going through
 # vLLM (or causing a Hugging Face download) just because it is in
 # SUPPORTED_MODELS.
-OCI_WAYFLOW_MODELS = frozenset({"gpt-6-luna"})
+OCI_WAYFLOW_MODELS = frozenset({"gpt-6-luna", "gpt-6-sol", "gpt-5.6-terra", "gpt-6-astra"})
 LOCAL_VLLM_MODELS = frozenset(set(SUPPORTED_MODELS) - OCI_WAYFLOW_MODELS)
 
 MODEL_PROFILES = {
@@ -181,6 +184,30 @@ MODEL_PROFILES = {
     ),
 }
 REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh")
+
+# WayFlow uses OCI Generic Chat. OCI model discovery advertises xhigh/max for
+# provider Responses calls, while the public Generic Chat schema stops at HIGH.
+OCI_REASONING_EFFORTS = {
+    "gpt-6-luna": frozenset({"none", "low", "medium", "high"}),
+    "gpt-6-sol": frozenset({"none", "low", "medium", "high"}),
+    "gpt-5.6-terra": frozenset({"none", "low", "medium", "high"}),
+    "gpt-6-astra": frozenset({"low", "medium", "high"}),
+}
+
+
+def validate_reasoning_effort(model_family: str, reasoning_effort: str) -> None:
+    """Reject effort levels that the selected runner cannot send."""
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(
+            f"unsupported reasoning effort {reasoning_effort!r}; "
+            f"choose one of {', '.join(REASONING_EFFORTS)}"
+        )
+    allowed = OCI_REASONING_EFFORTS.get(model_family)
+    if allowed is not None and reasoning_effort not in allowed:
+        raise ValueError(
+            f"{model_family} on OCI supports --reasoning-effort "
+            f"{', '.join(sorted(allowed))}"
+        )
 
 
 @dataclass(frozen=True)
@@ -401,13 +428,13 @@ def create_oci_wayflow_judge(
     seed: int,
     reasoning_effort: str,
 ) -> Any:
-    """Create a WayFlow OCI GenAI judge using the caller's OCI config file."""
+    """Create a WayFlow OCI GenAI model using the caller's OCI config file."""
     try:
         from wayflowcore.models import LlmGenerationConfig, OCIGenAIModel
         from wayflowcore.models.ociclientconfig import OCIClientConfigWithApiKey
     except ImportError as error:
         raise RuntimeError(
-            "GPT-6 Luna judging requires wayflowcore and the OCI SDK in the "
+            "OCI-backed judging requires wayflowcore and the OCI SDK in the "
             "SimBench environment."
         ) from error
 

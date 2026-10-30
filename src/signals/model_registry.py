@@ -63,6 +63,17 @@ DISCOVERY_MODEL_PROFILES: dict[str, DiscoveryModelProfile] = {
     "gpt-6-luna": DiscoveryModelProfile(
         "gpt-6-luna", "llm", SUPPORTED_MODELS["gpt-6-luna"], _ALL_METHODS, "gpt-6-luna"
     ),
+    "gpt-6-sol": DiscoveryModelProfile(
+        "gpt-6-sol", "llm", SUPPORTED_MODELS["gpt-6-sol"], _ALL_METHODS, "gpt-6-sol"
+    ),
+    "gpt-5.6-terra": DiscoveryModelProfile(
+        "gpt-5.6-terra", "llm", SUPPORTED_MODELS["gpt-5.6-terra"], _ALL_METHODS,
+        "gpt-5.6-terra",
+    ),
+    "gpt-6-astra": DiscoveryModelProfile(
+        "gpt-6-astra", "llm", SUPPORTED_MODELS["gpt-6-astra"], _ALL_METHODS,
+        "gpt-6-astra",
+    ),
 }
 
 

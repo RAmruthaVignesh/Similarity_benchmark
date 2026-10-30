@@ -72,6 +72,7 @@ from src.evaluation.llm_judge import (  # noqa: E402
     parse_judge_response,
     render_chat_prompt,
     schema_version,
+    validate_reasoning_effort,
 )
 from src.schema.schema_graph import SchemaGraph  # noqa: E402
 from src.signals.candidates import enumerate_signal_candidates  # noqa: E402
@@ -152,6 +153,10 @@ def main() -> int:
         temperature=1.0 if args.model in OCI_WAYFLOW_MODELS else 0.0,
         reasoning_effort=args.reasoning_effort,
     )
+    try:
+        validate_reasoning_effort(base_config.model_family, base_config.reasoning_effort)
+    except ValueError as error:
+        parser.error(str(error))
     candidate_config = {
         "hop_limit": args.hop_limit,
         "source_tables": list(args.source_tables or dataset.get_tables()),
@@ -308,7 +313,7 @@ def _run_oci_wayflow(
 ) -> int:
     """Run the same label protocol against OCI through WayFlow."""
     if not args.oci_compartment_id:
-        parser.error("set OCI_GENAI_COMPARTMENT or pass --oci-compartment-id for GPT-6 Luna")
+        parser.error("set OCI_GENAI_COMPARTMENT or pass --oci-compartment-id for an OCI model")
     config_path = args.oci_config.expanduser().resolve()
     if not config_path.is_file():
         parser.error(f"OCI config file does not exist: {config_path}")

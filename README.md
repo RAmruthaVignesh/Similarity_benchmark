@@ -387,9 +387,10 @@ The CLI keeps the **method** independent from the validated **model** profile:
 - `graph-search-oracle-root` is the same graph-search strategy with an
   externally supplied starting table; use it only as a diagnostic.
 
-Generative profiles such as `muse-glimmer-30b` and `gpt-6-luna` select the
-configured local-vLLM or OCI runner through the same `--model` flag. Raw model
-identifiers are intentionally not accepted: add a validated profile in
+Generative profiles such as `muse-glimmer-30b`, `gpt-6-luna`, `gpt-6-sol`,
+`gpt-5.6-terra`, and `gpt-6-astra` select the configured local-vLLM or OCI
+runner through the same `--model` flag. Raw model identifiers are intentionally
+not accepted: add a validated profile in
 `src/signals/model_registry.py` for a new compatible checkpoint.
 
 Do not compare nDCG across these two catalogs as if they were the same task.
@@ -444,9 +445,10 @@ truth relevance labels.
 ### Generative-LLM discovery
 
 Generative-LLM model profiles score each condition/signal pair independently with a
-generative LLM. It returns a **0--100 utility score** and short evidence note;
-this is a discovery score, not the 0--3 LLM-judge relevance grade and not a
-probability. With `--method graph-search`, the same pointwise score evaluates
+generative LLM. By default it returns a **0--10 utility score** and short
+evidence note; this is a discovery score, not the 0--3 LLM-judge relevance
+grade and not a probability. Use `--utility-scale 0-100` to request the earlier
+scale. With `--method graph-search`, the same pointwise score evaluates
 each legal graph action, retains the top `--branch-width` actions by within-menu
 ordinal rank, then reranks only the discovered shortlist. The
 `graph-search-oracle-root` strategy is the target-entity-proxy diagnostic.

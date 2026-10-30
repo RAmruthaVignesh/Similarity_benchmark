@@ -77,6 +77,9 @@ class ScoredSignal:
             evidence = metadata.get("evidence")
             if isinstance(evidence, str) and evidence:
                 record["evidence"] = evidence
+            token_usage = metadata.get("token_usage")
+            if isinstance(token_usage, Mapping):
+                record["token_usage"] = dict(token_usage)
         else:
             record["score"] = self.score
             if self.ranking_logit is not None:

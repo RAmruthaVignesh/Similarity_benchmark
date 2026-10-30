@@ -159,7 +159,7 @@ relevance labels.
 SYSTEM
 You identify useful schema signals for a retrieval or ranking condition. Score exactly one proposed signal, independently of any other signals. Use only the supplied schema context, condition, and signal definition. Do not assume row values, distributions, omitted joins, hidden fields, aggregation, or comparisons. A signal is evidence that a downstream model can use; it need not itself perform retrieval. For a relationship-only signal, credit only the association or connected rows on its stated path, not unlisted attributes of reached tables. Consider the starting entity, every path edge, and endpoint together.
 
-Return utility_score from 0 to 100: 0 means no plausible useful evidence; 25 means weak or indirect evidence; 50 means useful but incomplete evidence; 75 means strong evidence; 100 means central, direct evidence. Intermediate values are allowed. Return a concise schema-grounded evidence note. Return only the required JSON object and do not reveal private reasoning.
+Return utility_score from 0 to 10: 0 means no plausible useful evidence; 5 means useful but incomplete evidence; 10 means central, direct evidence. Intermediate integer values are allowed. Return a concise schema-grounded evidence note. Return only the required JSON object and do not reveal private reasoning.
 
 USER
 Schema:
@@ -173,6 +173,15 @@ Signal technical definition:
 
 Signal meaning:
 {{SIGNAL_HUMAN_EXPLANATION}}
+
+Return exactly {"utility_score": integer 0..10, "evidence": string}.
+```
+
+The 0–10 scale is the default and uses this prompt. `--utility-scale 0-100`
+keeps the same schema context and JSON fields, changing only the scale instruction to:
+
+```text
+Return utility_score from 0 to 100: 0 means no plausible useful evidence; 25 means weak or indirect evidence; 50 means useful but incomplete evidence; 75 means strong evidence; 100 means central, direct evidence. Intermediate integer values are allowed. Return a concise schema-grounded evidence note. Return only the required JSON object and do not reveal private reasoning.
 
 Return exactly {"utility_score": integer 0..100, "evidence": string}.
 ```
@@ -258,7 +267,7 @@ action over `stop_branch` or `stop_search`.
 
 ```text
 SYSTEM
-You guide a bounded relational-schema graph search. Score exactly one program-generated legal action for how well it advances discovery of useful signals for the condition. Use only the supplied state and action. Do not invent tables, columns, joins, or actions. Return utility_score from 0 to 100 using the same anchors: 0 no plausible progress, 25 weak progress, 50 useful progress, 75 strong progress, 100 central progress. Return a concise evidence note and only the required JSON object.
+You guide a bounded relational-schema graph search. Score exactly one program-generated legal action for how well it advances discovery of useful signals for the condition. Use only the supplied state and action. Do not invent tables, columns, joins, or actions. Return utility_score from 0 to 10 using the same anchors: 0 no plausible progress, 5 useful but incomplete progress, 10 central progress. Intermediate integer values are allowed. Return a concise evidence note and only the required JSON object.
 
 Action-specific criterion: {{ACTION_CRITERION}}
 
