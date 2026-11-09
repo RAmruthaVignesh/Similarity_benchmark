@@ -4,43 +4,12 @@ A benchmark for similarity over relational databases, built on
 [RelBench](https://relbench.stanford.edu/). The initial development dataset is
 **rel-amazon** (customers, products and time-stamped reviews).
 
-The project covers the data foundation: reading a dataset's schema,
-representing it as a graph, and building a small, validated local subset to
-develop against. It includes schema-only signal discovery and a controlled
-evaluation of that stage. End-to-end user-conditioned embeddings and similarity
-evaluation remain under development.
-
-## Controlled signal-discovery evaluation
-
-The repository includes a **controlled synthetic** evaluation for the
-signal-discovery stage. It uses the actual RelAmazon manifest and Parquet
-schemas, and the same full 39-candidate signal pool used by standard runs.
-The builder snapshots only schema metadata into empty Parquet tables; it does
-not copy or use source records. Its 25 conditions cover direct attributes,
-one- and two-hop paths, relationship evidence, multiple relevant signals,
-distractors, AND/OR logic, and temporal reasoning. Each task has explicit
-graded qrels and a rationale. The qrels are author-defined synthetic oracles,
-not human-validated judgments. This tests whether a ranker follows designed
-signal rules; it does not evaluate entity embeddings or replace human
-judgments on real conditions.
-
-```bash
-python scripts/build_controlled_signal_benchmark.py \
-  --schema-root data/dev/rel-amazon \
-  --output-root benchmarks/controlled-signal-discovery/rel-amazon-v2
-
-python scripts/evaluate_controlled_signals.py \
-  --method catalog-rank \
-  --model random \
-  --benchmark-root benchmarks/controlled-signal-discovery/rel-amazon-v2 \
-  --output results/rel-amazon/controlled-signal-discovery/v2/summary.json
-```
-
-The summary reports macro nDCG@1/3/5, Recall@1/3/5 for central (grade-3)
-signals, and MRR of the first central signal. The adjacent `*-tasks.jsonl`
-file records the top-ranked signals and per-condition scores for inspection.
-The backend implementations and prompt construction are shared with standard
-signal discovery; only the condition and synthetic qrels differ.
+The project covers schema-based signal discovery and conditioned similarity
+over relational entities. It includes discovery rankings evaluated against
+human signal labels, signal-specific similarity measures, external baseline
+comparisons, and exploratory end-to-end tools. The similarity-scoring and
+ranking evaluation work is experimental and is being developed alongside its
+analysis notebooks.
 
 ## Layout
 
@@ -50,21 +19,15 @@ data/
   dev/<dataset>/                      generated development subset (git-ignored)
     review.parquet, product.parquet, customer.parquet, manifest.yaml
 conditions/
-  <dataset>/conditions-vN.jsonl       versioned static user intents (tracked input)
+  <dataset>/conditions.jsonl          static conditions (tracked input)
 annotations/
   <dataset>/human/<annotator>.jsonl   reviewable human relevance judgments
-  <dataset>/llm/<prompt-version>/     generated model judgments (git-ignored)
-benchmarks/
-  controlled-signal-discovery/<dataset>-vN/
-                                      generated schema snapshots and oracle qrels
 results/
   <dataset>/discovery/                ranked signal outputs
-  <dataset>/controlled-signal-discovery/vN/
-                                      synthetic-benchmark summaries and task rows
-  <dataset>/llm-judge/                judge metrics and throughput profiles
 docs/                                 protocols, exact prompts, and design notes
 notebooks/                            interactive result analysis
 src/
+  llm_backends.py             shared local and OCI model setup
   datasets/
     relbench_manifest.py      parse a manifest into dataclasses
     relational_dataset.py     storage-independent relational dataset interface
@@ -78,8 +41,6 @@ src/
     candidates.py             direct attributes and relational-path candidates
     scorers.py                MiniLM and Strands Decider backend implementations
     llm_discovery.py          pointwise generative-LLM backend and prompts
-  synthetic/
-    controlled_signal_benchmark_v2.py  real-schema controlled qrels
 scripts/
   inspect_manifest.py         print a parsed manifest
   build_dev_subset.py         build data/dev/<dataset>/
@@ -88,12 +49,17 @@ scripts/
 tests/                        unittest suites, all offline
 ```
 
-`data/` contains source inputs and local development subsets; `benchmarks/`
-contains generated benchmark fixtures and oracle labels; `annotations/`
-contains relevance judgments; and `results/` contains outputs derived from a
-method or evaluation. See
-[`docs/PROJECT_LAYOUT.md`](docs/PROJECT_LAYOUT.md) for naming and artifact
-retention rules.
+`data/` contains source inputs and local development subsets; `annotations/`
+contains human relevance judgments; and `results/` contains outputs derived
+from discovery and similarity experiments. The Markdown files in `docs/`
+describe the current methods, prompts, and result formats.
+
+The RelAmazon condition file contains 15 conditions. Existing IDs were made
+unique when the three sets were merged: former v1 IDs 001–005 remain 001–005,
+former v2 IDs 001–005 are now 006–010, and former v3 IDs 001–005 are now
+011–015. Human judgments, oracle roots, and saved discovery runs
+use the same IDs. Runs that evaluated only some conditions keep that coverage;
+for example, the saved Astra run covers four conditions.
 
 ## Setup
 
@@ -329,7 +295,7 @@ recovered by the final ranking.
 
 `graph-search-oracle-root` uses the same search and reranking process,
 but fixes the initial table from a condition-to-table JSON mapping. For the
-current RelAmazon conditions-v3 file, `conditions/rel-amazon/oracle-root-map-v3.json`
+merged RelAmazon conditions file, `conditions/rel-amazon/oracle-root-map.json`
 maps each condition to the entity type it explicitly asks to retrieve (product,
 review, or customer). This is a **target-entity proxy**, not a human-validated
 gold root: useful signals can start from other entities, so interpret this as a
@@ -348,7 +314,7 @@ Inspect candidates before loading a model:
 
 ```bash
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --source-table product \
   --hop-limit 2 \
   --list-only \
@@ -372,7 +338,7 @@ given output filename:
 
 ```bash
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method catalog-rank --model minilm --catalog-view both \
   --output results/rel-amazon/discovery/minilm.jsonl
 ```
@@ -401,7 +367,7 @@ Run the two comparable local scoring baselines:
 
 ```bash
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method catalog-rank --model minilm \
   --output results/rel-amazon/discovery/minilm-signals.jsonl
 
@@ -409,29 +375,29 @@ python scripts/discover_signals.py \
 # available. The first invocation downloads both the adapter and Gemma base
 # weights into the configured Hugging Face cache.
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method catalog-rank --model strands-decider \
   --output results/rel-amazon/discovery/strands-decider-e4b-signals.jsonl
 
 # Strands-guided graph discovery followed by reranking from the explored-schema
 # view of only the discovered signals.
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method graph-search --model strands-decider \
   --max-decisions 12 --branch-width 2 --max-signals 10 \
   --output results/rel-amazon/discovery/strands-decider-e4b-graph-reranked-signals.jsonl
 
-# Target-entity-proxy root ablation for conditions-v3.
+# Target-entity-proxy root ablation for the merged conditions.
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method graph-search-oracle-root --model strands-decider \
-  --oracle-root-map conditions/rel-amazon/oracle-root-map-v3.json \
+  --oracle-root-map conditions/rel-amazon/oracle-root-map.json \
   --max-decisions 30 --branch-width 3 --max-signals 10 \
   --output results/rel-amazon/discovery/strands-decider-e4b-graph-oracle-root.jsonl
 
 # Reproducible random ranking baseline (no model weights are loaded).
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --hop-limit 2 --method catalog-rank --model random --seed 42 \
   --output results/rel-amazon/discovery/random-seed42.jsonl
 
@@ -446,21 +412,19 @@ truth relevance labels.
 
 Generative-LLM model profiles score each condition/signal pair independently with a
 generative LLM. By default it returns a **0--10 utility score** and short
-evidence note; this is a discovery score, not the 0--3 LLM-judge relevance
-grade and not a probability. Use `--utility-scale 0-100` to request the earlier
+evidence note; this is a discovery utility score, not a probability or a human relevance grade. Use `--utility-scale 0-100` to request the earlier
 scale. With `--method graph-search`, the same pointwise score evaluates
 each legal graph action, retains the top `--branch-width` actions by within-menu
 ordinal rank, then reranks only the discovered shortlist. The
 `graph-search-oracle-root` strategy is the target-entity-proxy diagnostic.
 
-The local models run through vLLM; GPT-6 Luna reuses the OCI/Wayflow setup used
-by the judge script. Pass `--model-cache-root` to keep Hugging Face weights out
+The local models run through vLLM; GPT-6 Luna uses OCI through WayFlow. Pass `--model-cache-root` to keep Hugging Face weights out
 of `/home`, and `--resume` to persist completed conditions as they finish.
 
 ```bash
 # Full-catalog schema reasoning with a local model.
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --dataset-root data/dev/rel-amazon \
   --method catalog-rank --model muse-glimmer-30b \
   --hop-limit 2 --batch-size 4 --max-tokens 256 --max-attempts 2 \
@@ -469,7 +433,7 @@ python scripts/discover_signals.py \
 
 # LLM-guided graph search and LLM shortlist reranking.
 python scripts/discover_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+  --conditions conditions/rel-amazon/conditions.jsonl \
   --dataset-root data/dev/rel-amazon \
   --method graph-search --model muse-glimmer-30b \
   --hop-limit 2 --max-decisions 12 --branch-width 2 --max-signals 10 \
@@ -479,147 +443,160 @@ python scripts/discover_signals.py \
 ```
 
 Evaluate these runs against the human qrels in
-`notebooks/analyze_signal_discovery_results.ipynb`. LLM qrels are diagnostic
-views only, because using them as headline labels for an LLM discovery method
-would introduce evaluator/model bias.
+`notebooks/analyze_signal_discovery_results.ipynb`. The current discovery
+prompts are documented in [signal-discovery-prompts.md](docs/signal-discovery-prompts.md).
 
-## LLM-as-a-judge signal relevance evaluation
+## Signal-specific entity similarity (proposal §3.2)
 
-`scripts/judge_signals.py` produces **blinded, schema-only, pair-level** LLM
-judgments. Each model sees a condition, one candidate signal (including its
-complete path), and the schema. It never sees
-a discovery method, its score, its rank, or graph-search history. Each run
-always evaluates three wording-only prompt variants with the same rubric and
-decoding configuration. It writes their resumable raw labels in a `variants/`
-subdirectory and writes a consensus JSONL at `--output`. The consensus grade
-is the median of the three ordinal grades: this is the majority grade whenever
-one exists, and selects the middle grade for a three-way tie. Completed raw
-labels are reused only when the condition, candidate, schema/candidate catalog,
-prompt, model revision, and sampling configuration have the same cache key.
+`scripts/score_entity_similarity.py` is the first deterministic implementation
+of §3.2. It takes signals already selected in §3.1, materializes each signal
+for every entity in its source table, and computes transparent entity-pair
+scores. It does **not** select signals, use relevance labels, learn weights, or
+turn scores into final similarity grades yet.
 
-The local presets are Mistral Small 3.2 (24B), Meta Muse Glimmer 30B, Google
-Gemma 4 31B IT, and OpenAI GPT-OSS-120B. All use vLLM's offline batched
-engine, JSON-Schema-constrained decoding, and prefix caching. The 30--31B
-checkpoints default to one 80 GB H100, with a conservative 2,048-token context
-limit and four active sequences to preserve KV-cache headroom. GPT-OSS-120B
-uses its official MXFP4 checkpoint and also defaults to one 80 GB H100, with a
-2,048-token context limit and eight active sequences. Install vLLM in the
-separate SimBench environment; this is optional for all other repository
-functionality:
+The automatic measure selection is type- and path-aware while remaining
+inspectable:
 
-```bash
-pip install -U "vllm>=0.19.0" mistral-common
-```
+- direct numeric values use empirical-percentile distance; multi-valued numeric
+  paths use percentile-normalized one-dimensional Wasserstein similarity. This
+  is robust to numeric outliers such as a few unusually expensive products;
+- dates and timestamps use the same scalar/distribution distinction on their
+  empirical temporal percentiles;
+- list-valued categorical fields are flattened, HTML-normalized, and compared
+  by IDF-weighted Jaccard. Common labels therefore contribute less than a
+  discriminative label; scalar categoricals use equality. Entity-name fields
+  are treated as categorical identifiers rather than semantic text;
+- a multi-valued boolean field is compared by its rate (for example, the share
+  of verified reviews), rather than by the uninformative set `{True, False}`;
+- text-like fields (`description`, `title`, `summary`, or `*_text`) use
+  contextual E5 embeddings and cosine similarity, including for path-derived
+  text collections;
+- multi-row evidence reached through a path receives a visible support-based
+  confidence factor when signals are combined. A collection with one related
+  row cannot dominate one supported by many rows;
+- relationship paths ending at identified entities use neighborhood Jaccard.
+  A path ending in rows with no primary key instead uses degree similarity,
+  rather than pretending anonymous rows form a reusable neighbour set.
 
-`--model gpt-6-luna` is a separate cloud-backed judge. It uses WayFlow's OCI
-GenAI adapter with the user's OCI config and `OCI_GENAI_COMPARTMENT`; it does
-not download weights, use a local GPU, or use vLLM. It sends the same blinded
-prompt variants and writes exactly the same raw-variant and consensus JSONL
-format as the local judges. GPT-6 Luna's OCI endpoint uses its provider-default
-temperature, so the run records `temperature=1.0`; `--seed` is still passed to
-OCI and retained in every cache key. Use a 512-token cap so a valid JSON answer
-is not squeezed out by model reasoning.
+Four explicit alternatives are also available through `--measure-variant` or
+per-signal `--signal-measure SIGNAL_ID=VARIANT` overrides:
 
-Run the same frozen catalog through each judge. Pin a Hugging Face commit hash
-rather than `main` before treating outputs as frozen qrels. The script does not
-assume a user-specific cache location: it respects standard Hugging Face cache
-settings (`HF_HOME`/`HF_HUB_CACHE`) and Hugging Face's normal defaults. To put
-model and runtime caches on storage, set `SIMBENCH_MODEL_CACHE_ROOT` to a path
-that is accessible to the Ray workers; the script places Hugging Face, vLLM,
-PyTorch, and XDG caches beneath it. Explicit settings such as `HF_HOME` still
-take precedence. Because Ray workers may run under a service account, use an
-absolute path that the worker can read, rather than relying on `$HOME` or the
-worker's `$USER` to identify the submitting user's cache.
+- `jensen-shannon` compares categorical/boolean frequencies, endpoint sets, or
+  quantile-binned numeric and temporal path distributions. It reports
+  `1 - sqrt(JS)` using base-2 divergence, so scores stay in `[0, 1]`. For
+  relationship signals, the endpoint table must have a primary key; anonymous
+  row positions are not meaningful shared categories.
+- `hellinger` compares the same kinds of distributions and reports
+  `1 - Hellinger distance`, also in `[0, 1]`, with the same stable-endpoint-ID
+  requirement for relationship signals.
+- `wl-subtree-kernel` is for relationship signals. It builds a rooted,
+  table- and foreign-key-typed ego-graph restricted to the signal path, applies
+  Weisfeiler–Lehman neighborhood relabeling, then compares the resulting
+  subtree-count vectors with cosine similarity.
+- `diffusion-distance` is for relationship signals. It projects shared
+  endpoint entities into a weighted graph over the source entities, downweights
+  popular endpoints, adds a 0.2 restart mass, and compares one-step random-walk
+  profiles by normalized Euclidean distance. The endpoint table must have a
+  primary key; entities with no shared-endpoint neighbors have no diffusion
+  score.
 
-```bash
-export SIMBENCH_MODEL_CACHE_ROOT="/storage/${USER}/model-cache"
+These variants are explicit experiments; `auto` remains the default. The
+distribution alternatives require discrete values or multi-valued numeric or
+temporal paths. The graph variants require relationship signals. The
+diffusion projection has an edge-count guard to avoid unexpectedly large
+materializations.
 
-# The relationship-only clarification and paired plain-language candidate
-# explanation and full prompt paraphrases are prompt version v7. Keep these
-# labels separate from v4-v6.
-
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --dataset-root data/dev/rel-amazon \
-  --model mistral \
-  --model-revision main \
-  --batch-size 16 \
-  --output annotations/rel-amazon/llm/signal-relevance-v7/mistral-small-3.2.jsonl
-
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --dataset-root data/dev/rel-amazon \
-  --model gpt-oss-120b \
-  --model-revision main \
-  --batch-size 8 \
-  --max-tokens 512 \
-  --output annotations/rel-amazon/llm/signal-relevance-v7/gpt-oss-120b.jsonl
-
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --dataset-root data/dev/rel-amazon \
-  --model gpt-6-luna \
-  --batch-size 4 \
-  --max-tokens 512 \
-  --output annotations/rel-amazon/llm/signal-relevance-v7/gpt-6-luna.jsonl \
-  --metrics-output results/rel-amazon/llm-judge/signal-relevance-v7/gpt-6-luna-metrics.json
-```
-
-Before a full run, benchmark steady-state annotation speed without writing any
-judgments. The printed/filed metrics separate model-load and warm-up time from
-prompt throughput, and include prompt/output token rates and JSON validity.
+For example, score products relative to product `197` using the top discovery
+signal for `condition-001` that starts from `product`. When a discovery file is
+used, `--top-signals` counts only signals rooted at `--entity-table`; it never
+averages paths rooted at another entity type. The output has one JSONL record
+per query and keeps the combined score plus every individual signal/measure
+component for each candidate entity.
 
 ```bash
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
+python scripts/score_entity_similarity.py \
+  --conditions conditions/rel-amazon/conditions.jsonl \
+  --condition-id condition-001 \
   --dataset-root data/dev/rel-amazon \
-  --model mistral \
-  --batch-size 16 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
-  --metrics-output results/rel-amazon/llm-judge/profiles/mistral-small-3.2-throughput.json
-
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --dataset-root data/dev/rel-amazon \
-  --model muse-glimmer-30b \
-  --batch-size 4 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
-  --metrics-output results/rel-amazon/llm-judge/profiles/muse-glimmer-30b-throughput.json
-
-python scripts/judge_signals.py \
-  --conditions conditions/rel-amazon/conditions-v3.jsonl \
-  --dataset-root data/dev/rel-amazon \
-  --model gemma-4-31b \
-  --batch-size 4 --benchmark-only --benchmark-pairs 64 --warmup-pairs 8 \
-  --metrics-output results/rel-amazon/llm-judge/profiles/gemma-4-31b-throughput.json
-
+  --entity-table product \
+  --discovery-results results/rel-amazon/discovery/catalog-views/catalog-rank-gpt-6-luna-utility-0-10-high-path-aware.jsonl \
+  --top-signals 1 \
+  --measure-variant auto \
+  --query-id 197 \
+  --top-k 20 \
+  --model-cache-root /storage/lcostes/model-cache/huggingface/hub \
+  --output results/rel-amazon/similarity/condition-001-product-197.jsonl
 ```
 
-The judge uses a strict JSON Schema: exactly the top-level fields `status`,
-`grade`, and `reason` are allowed. The v7 prompt uses three full, equivalent
-instruction variants rather than changing only the opening sentence. It
-presents each candidate with
-both its canonical technical definition and the same plain-language explanation
-shown by the human annotation tool. The v7 prompt also explicitly defines a signal
-as evidence for a downstream retriever or ranker, rather than as a complete
-retrieval procedure. It infers the retrieval target from the intent itself and
-grades the complete source-to-signal path, while treating a direct zero-hop
-attribute of records named in the intent as valid evidence. The rubric is: `0 = no plausible useful
-evidence`, `1 = weak or indirect`, `2 = meaningfully useful but incomplete,
-noisy, general, or not central`, and `3 = central and direct`.
+To compare a relationship signal with the WL subtree kernel, replace the
+discovery source with an explicit relationship signal and set
+`--measure-variant wl-subtree-kernel`. Use `--measure-variant diffusion-distance`
+for the one-step diffusion score. When selected signals need different
+measures, keep `--measure-variant auto` and override individual IDs, for example
+`--signal-measure 'SIGNAL_ID=hellinger'`.
 
-`--reasoning-effort` is versioned in the cache key. GPT-OSS supports `none`,
-`low`, `medium`, and `high`; GPT-6 Luna accepts `none`, `low`, `medium`,
-`high`, and `xhigh` through OCI. Use `none` for concise structured judgments.
-Mistral, Muse Glimmer, and Gemma use `none`.
+Text values are encoded with the contextual `intfloat/e5-small-v2` encoder
+through vLLM's batched pooling runner. For a path that yields many texts per
+entity (for example a product's 100 reviews), the current implementation
+averages individual text embeddings; that collection representation can become
+too similar across entities and should be treated as a baseline, not the final
+review-profile measure. No model is downloaded automatically by the similarity
+layer.
 
-After human calibration, open
-[`notebooks/analyze_signal_discovery_results.ipynb`](notebooks/analyze_signal_discovery_results.ipynb)
-to browse discovery rankings and compare them interactively against human or
-LLM qrels. It reports qrel coverage and does not count unjudged candidates as
-irrelevant.
+Text vectors are cached persistently by model snapshot and exact E5 input, so
+the same text value is embedded only once across signals and path variants. To
+warm the cache for the local RelAmazon subset, run this once from the SimBench
+environment; rerunning it is resumable and skips cached vectors:
 
-LLM judgments are scalable weak qrels, not human ground truth. The detailed
-rubric, audit protocol, and model-selection rationale are in
-[`docs/LLM_AS_A_JUDGE_DESIGN.md`](docs/LLM_AS_A_JUDGE_DESIGN.md).
+```bash
+export SIMBENCH_TMPDIR=/storage/lcostes/tmp
+export TMPDIR="$SIMBENCH_TMPDIR"
+export LD_LIBRARY_PATH="/storage/lcostes/ray-share/venvs/simbench/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+python scripts/precompute_text_embeddings.py \
+  --dataset-root data/dev/rel-amazon \
+  --model-cache-root /storage/lcostes/model-cache/huggingface/hub \
+  --embedding-cache /storage/lcostes/simbench-cache/text-embeddings.sqlite3
+```
+
+The explorer notebooks and `score_entity_similarity.py` use this cache by
+default. Override its path with `SIMBENCH_TEXT_EMBEDDING_CACHE` if needed.
+
+Use explicit selected candidate IDs instead of a discovery result when you want
+to test a hand-authored signal set. Several signals are combined by a weighted
+mean of their available component scores; specify a non-default weight with
+`--signal-weight 'SIGNAL_ID=WEIGHT'`. The next §3.2 stages are to validate
+which measures and combinations represent each condition, then learn or
+otherwise calibrate the combination and convert the resulting scores into
+similarity levels.
+
+For interactive inspection without relying on notebook widgets, start the
+local browser explorer:
+
+```bash
+conda run -p /storage/lcostes/ray-share/venvs/simbench \
+  python scripts/explore_similarity_ui.py
+```
+
+The server tries port `8765` and automatically searches the next 49 ports if it
+is occupied; its terminal prints the port it actually selected. On the remote
+compute host, use VS Code's **Ports** view to forward that printed port, then
+open the forwarded address. You can set the starting port with `--port` or the
+search range with `--port-attempts`. The UI
+lets you choose a condition and discovery run, restricts selection to signals
+rooted at the retrieved entity type, changes weights, and displays component
+scores plus raw nearest records. It runs locally and makes no external model or
+API calls.
+
+The notebook version is interactive too and uses `ipywidgets`; select the base
+Python kernel where that package is installed, then rerun its cells.
+
+[`notebooks/demo_end_to_end_similarity.ipynb`](notebooks/demo_end_to_end_similarity.ipynb)
+provides a separate end-to-end POC: enter free-form condition text, run
+catalog signal discovery with an OCI model, select compatible signals and
+weights, and inspect the resulting nearest-entity ranking. It uses the
+SimBench Conda environment for discovery and the notebook's base kernel for
+the interactive controls. Its current OCI compartment is configured directly
+in the notebook.
 
 ## Tests
 

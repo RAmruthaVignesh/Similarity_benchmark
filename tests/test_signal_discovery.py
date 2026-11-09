@@ -110,7 +110,7 @@ class _FakePointwiseLLM:
 class _FakeSignalLLM(LLMPointwiseSignalScorer):
     def _generate(self, messages):
         # Deliberately ties every candidate to exercise deterministic ID ordering.
-        return ['{"utility_score": 50, "evidence": "schema evidence"}'] * len(messages)
+        return ['{"utility_score": 5, "evidence": "schema evidence"}'] * len(messages)
 
 
 class _ZeroTiePointwiseLLM:
@@ -207,20 +207,20 @@ tables:
 
     def test_pointwise_utility_parser_rejects_invalid_values(self):
         self.assertEqual(
-            parse_utility_response('{"utility_score": 50, "evidence": "schema grounded"}')["status"],
+            parse_utility_response('{"utility_score": 5, "evidence": "schema grounded"}')["status"],
             "scored",
         )
         self.assertEqual(
-            parse_utility_response('{"utility_score": 101, "evidence": "bad"}')["status"],
+            parse_utility_response('{"utility_score": 11, "evidence": "bad"}')["status"],
             "invalid_response",
         )
 
     def test_pointwise_utility_parser_recovers_valid_score_from_bad_evidence_quoting(self):
         parsed = parse_utility_response(
-            '{"utility_score": 62, "evidence": "Product text is "useful" context"}'
+            '{"utility_score": 6, "evidence": "Product text is "useful" context"}'
         )
         self.assertEqual(parsed["status"], "scored")
-        self.assertEqual(parsed["utility_score"], 62)
+        self.assertEqual(parsed["utility_score"], 6)
         self.assertEqual(parsed["parse_status"], "recovered_score")
 
     def test_llm_graph_navigator_retains_ordinal_action_trace(self):
@@ -263,7 +263,7 @@ tables:
         ))
         ranked = scorer.score("Find products", candidates, self.graph)
         self.assertEqual([item.candidate.id for item in ranked], sorted(candidate.id for candidate in candidates))
-        self.assertTrue(all(item.metadata and item.metadata["utility_score"] == 50 for item in ranked))
+        self.assertTrue(all(item.metadata and item.metadata["utility_score"] == 5 for item in ranked))
         prompt = build_signal_prompt("Find products", candidates[0], self.graph, "Schema: x")
         self.assertNotIn("Relevance grades", "\n".join(message["content"] for message in prompt))
 

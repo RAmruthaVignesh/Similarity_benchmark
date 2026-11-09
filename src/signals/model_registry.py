@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.evaluation.llm_judge import SUPPORTED_MODELS
+from src.llm_backends import SUPPORTED_MODELS
 
 
 CATALOG_RANK = "catalog-rank"

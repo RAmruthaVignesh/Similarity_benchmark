@@ -35,9 +35,9 @@ from src.signals.scorers import (  # noqa: E402
     create_choice_decider_client,
 )
 
-DEFAULT_CONDITIONS = REPO_ROOT / "conditions" / "rel-amazon" / "conditions-v3.jsonl"
+DEFAULT_CONDITIONS = REPO_ROOT / "conditions" / "rel-amazon" / "conditions.jsonl"
 DEFAULT_DATASET_ROOT = REPO_ROOT / "data" / "dev" / "rel-amazon"
-DEFAULT_ORACLE_ROOT_MAP = REPO_ROOT / "conditions" / "rel-amazon" / "oracle-root-map-v3.json"
+DEFAULT_ORACLE_ROOT_MAP = REPO_ROOT / "conditions" / "rel-amazon" / "oracle-root-map.json"
 
 
 def main() -> int:
@@ -508,7 +508,7 @@ def _llm_provenance(config: LLMDiscoveryConfig) -> dict[str, object]:
         "max_tokens": config.max_tokens,
         "reasoning_effort": config.reasoning_effort,
         "max_attempts": config.max_attempts,
-        "evaluation_note": "Discovery does not use human or LLM relevance labels.",
+        "evaluation_note": "Discovery does not use human relevance labels.",
     }
 
 

@@ -1,7 +1,6 @@
 """Pointwise generative-LLM scoring for schema signal discovery.
 
-This module deliberately does *not* reuse the relevance-judging prompt or its
-0--3 grades. It asks an LLM for an absolute utility estimate for one
+This module asks an LLM for an absolute utility estimate for one
 condition/signal (or one legal graph action) at a time. The default scale
 is 0--10, with 0--100 available as an option; human qrels remain independent of discovery.
 """
@@ -14,13 +13,13 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from src.evaluation.llm_judge import (
+from src.llm_backends import (
     LOCAL_VLLM_MODELS,
     MODEL_PROFILES,
     OCI_WAYFLOW_MODELS,
     SUPPORTED_MODELS,
     chat_template_kwargs,
-    create_oci_wayflow_judge,
+    create_oci_wayflow_model,
     create_vllm,
     describe_schema,
     render_chat_prompt,
@@ -459,7 +458,7 @@ class LLMPointwiseSignalScorer:
             except ImportError as error:  # pragma: no cover - runtime dependency
                 raise RuntimeError("OCI discovery requires the OCI SDK") from error
             oci_config = oci.config.from_file(self.config.oci_config, self.config.oci_profile)
-            self._oci_model = create_oci_wayflow_judge(
+            self._oci_model = create_oci_wayflow_model(
                 model_name=self.config.model_name,
                 compartment_id=self.config.oci_compartment_id,
                 config_path=self.config.oci_config,
