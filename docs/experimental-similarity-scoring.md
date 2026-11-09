@@ -15,12 +15,13 @@ There is one experimental scoring method: bounded robust-z normalization. It is 
 
 ## Evaluate existing saved scores
 
-From the repository root, in the SimBench environment:
+From the repository root, after activating an environment with the project
+dependencies installed:
 
-    export TMPDIR=/storage/lcostes/tmp
-    export HF_HOME=/storage/lcostes/model-cache/huggingface
-    export HF_HUB_CACHE=/storage/lcostes/model-cache/huggingface/hub
-    /storage/lcostes/ray-share/venvs/simbench/bin/python scripts/evaluate_experimental_similarity.py
+```bash
+conda activate simbench
+python scripts/evaluate_experimental_similarity.py
+```
 
 This reads the existing component-score files, so it does not rerun discovery or embeddings. The default output is `results/rel-amazon/similarity/experimental-scoring-bounded-robust-z`, with one directory per condition. Use repeated `--condition-id condition-001` arguments to select conditions. The runner refuses to overwrite profiles already present; choose a new `--output-dir` for a fresh run. Earlier unbounded robust-z results remain in `experimental-scoring-robust-z` and are not loaded by the current notebook.
 
@@ -34,6 +35,8 @@ Pass `--experimental-profile /path/to/profile.json` to `scripts/score_entity_sim
 
 Run `scripts/annotate_similarity_comparisons.py` to compare held-out candidates without displaying which method produced each candidate. It shows full entity attributes, randomizes A/B order reproducibly, spreads cases across conditions, and saves each preference immediately. Disagreement cases compare distinct top candidates; agreement controls compare the shared top candidate with the original ranking’s unique next candidate. Tied tops are skipped.
 
-    /storage/lcostes/ray-share/venvs/simbench/bin/python scripts/annotate_similarity_comparisons.py --max-pairs 30
+```bash
+python scripts/annotate_similarity_comparisons.py --max-pairs 30
+```
 
 The default output is `annotations/rel-amazon/entity-comparisons/bounded-robust-z-pairwise.jsonl`. These labels concern entity similarity and are separate from signal-discovery labels.

@@ -102,14 +102,17 @@ evidence coverage. See
 
 ## Running the pipeline
 
-Run commands from the repository root in the SimBench environment. On the
-shared machine the environment and model cache are typically configured as:
+Run commands from the repository root in an environment with the project
+dependencies installed. Activate it using the name or path configured for your
+machine, for example:
 
 ```bash
-conda activate /storage/lcostes/ray-share/venvs/simbench
-export HF_HOME=/storage/lcostes/model-cache/huggingface
-export HF_HUB_CACHE=/storage/lcostes/model-cache/huggingface/hub
+conda activate simbench
 ```
+
+The Hugging Face libraries use their standard cache by default. If your team
+uses a shared cache, configure `HF_HOME` or `HF_HUB_CACHE` in your own shell
+environment rather than relying on a machine-specific path in this repository.
 
 Inspect current options rather than relying on old commands:
 
